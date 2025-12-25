@@ -1,63 +1,260 @@
-import streamlit as st
-from datetime import datetime
+import os
+import io
 import json
 import zipfile
-from pathlib import Path
+from datetime import datetime
+import hashlib
 import secrets
+import streamlit as st
 
-st.set_page_config(page_title="Módulo 2 – Stock y Compras")
+from engine_f2 import (
+    HardValidationError,
+    ValidationIssue,
+    read_stock_and_mtd,
+    validate_mtd_month,
+    read_and_validate_projection,
+    read_and_validate_transit,
+)
 
-st.title("Módulo 2 – Stock y Compras")
-st.caption("FASE 1 – Carga de archivos y generación de RUN")
+RUNS_DIR = "runs"
 
-def make_run_id():
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    rnd = secrets.token_hex(3)
-    return f"RUN_{ts}_{rnd}"
 
-def save_file(uploaded_file, path):
-    path.write_bytes(uploaded_file.getbuffer())
+def ensure_dirs():
+    os.makedirs(RUNS_DIR, exist_ok=True)
 
-def zip_folder(folder, zip_path):
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        for f in folder.rglob("*"):
-            if f.is_file():
-                z.write(f, f.relative_to(folder))
 
-st.markdown("### Subí los archivos")
+def now_ts():
+    return datetime.now()
 
-stock = st.file_uploader("Stock actual", type=["xlsx", "csv"])
-incoming = st.file_uploader("Próximos ingresos", type=["xlsx", "csv"])
-forecast = st.file_uploader("Proyección de ventas", type=["xlsx", "csv"])
 
-if st.button("RUN"):
-    if not all([stock, incoming, forecast]):
-        st.error("Tenés que subir los 3 archivos.")
-    else:
-        run_id = make_run_id()
-        base = Path("runs") / run_id
-        inputs = base / "inputs"
-        inputs.mkdir(parents=True, exist_ok=True)
+def make_run_id(dt: datetime) -> str:
+    return f"RUN_{dt.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(4)}"
 
-        save_file(stock, inputs / stock.name)
-        save_file(incoming, inputs / incoming.name)
-        save_file(forecast, inputs / forecast.name)
 
-        run_log = {
-            "RUN_ID": run_id,
-            "STATUS": "OK_F1",
-            "TIMESTAMP": datetime.now().isoformat()
-        }
+def sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
 
-        (base / "run_log.json").write_text(json.dumps(run_log, indent=2), encoding="utf-8")
 
-        zip_path = base / f"{run_id}.zip"
-        zip_folder(base, zip_path)
+def save_uploaded_files(run_path: str, uploaded_files):
+    inputs_dir = os.path.join(run_path, "inputs")
+    os.makedirs(inputs_dir, exist_ok=True)
 
-        st.success(f"Corrida creada: {run_id}")
-        st.download_button(
-            "Descargar ZIP",
-            zip_path.read_bytes(),
-            file_name=f"{run_id}.zip"
+    saved = []
+    for uf in uploaded_files:
+        content = uf.getvalue()
+        file_hash = sha256_bytes(content)
+        dst = os.path.join(inputs_dir, uf.name)
+
+        with open(dst, "wb") as f:
+            f.write(content)
+
+        saved.append({
+            "original_name": uf.name,
+            "size_bytes": len(content),
+            "sha256": file_hash,
+            "stored_path": dst.replace("\\", "/"),
+        })
+    return saved
+
+
+def build_run_log_base(run_id: str, created_at: datetime, input_files_meta, fecha_corte_override_iso: str | None):
+    fecha_corte_default = created_at.date().isoformat()
+    fecha_corte_efectiva = fecha_corte_override_iso or fecha_corte_default
+    return {
+        "RUN_ID": run_id,
+        "CREATED_AT": created_at.isoformat(timespec="seconds"),
+        "FECHA_CORTE_DEFAULT": fecha_corte_default,
+        "FECHA_CORTE_OVERRIDE": fecha_corte_override_iso,
+        "FECHA_CORTE_EFECTIVA": fecha_corte_efectiva,
+        "OVERRIDE_ACTIVO": bool(fecha_corte_override_iso),
+        "INPUT_FILES": input_files_meta,
+        "STATUS": None,
+        "VALIDATIONS": [],
+        "ERRORS": [],
+        "PARAMS_EFECTIVOS": {},
+        "COUNTS": {},
+        "NOTES": "FASE 2: Lectura estricta y validaciones duras. Sin simulación ni outputs de negocio.",
+    }
+
+
+def write_json(path: str, obj: dict):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def make_zip_bytes(run_path: str) -> bytes:
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        # incluir todo lo relevante del run
+        for root, _, files in os.walk(run_path):
+            for fn in files:
+                full = os.path.join(root, fn)
+                rel = os.path.relpath(full, run_path)
+                z.write(full, arcname=rel.replace("\\", "/"))
+    mem.seek(0)
+    return mem.read()
+
+
+def issues_to_dict(issues: list[ValidationIssue]):
+    return [{"level": i.level, "code": i.code, "message": i.message} for i in issues]
+
+
+st.set_page_config(page_title="IA Operativa — Módulo 2 (FASE 2)", layout="wide")
+ensure_dirs()
+
+st.title("IA Operativa — Módulo 2: Stock y Compras (FASE 2)")
+st.caption("FASE 2: Lectura estricta de inputs + Validaciones duras (falla total).")
+
+with st.expander("📌 Estado de fase", expanded=True):
+    st.write("- **FASE 2 activa**: se leen inputs según v1.4 y se validan. Si hay error, **no se produce nada parcial**.")
+    st.write("- No hay simulación ni outputs (#1/#2/#3). Eso es FASE 3.")
+
+uploaded = st.file_uploader(
+    "Subí los archivos del Módulo 2 (xlsx). En FASE 2 se validan estrictamente.",
+    accept_multiple_files=True,
+    type=["xlsx"]
+)
+
+if uploaded and len(uploaded) > 0:
+    st.subheader("Mapeo de archivos (obligatorio en FASE 2)")
+    names = [u.name for u in uploaded]
+
+    colA, colB = st.columns(2)
+
+    with colA:
+        modulo_central_name = st.selectbox(
+            "Seleccioná el archivo que corresponde a **Modulo Central.xlsx**",
+            options=["(no seleccionado)"] + names,
+            index=0
+        )
+        proyeccion_name = st.selectbox(
+            "Seleccioná el archivo que corresponde a **PROYECCION - SKU  MAYO 2026.xlsx**",
+            options=["(no seleccionado)"] + names,
+            index=0
         )
 
+    with colB:
+        importaciones_name = st.selectbox(
+            "Seleccioná el archivo que corresponde a **Importaciones (1).xlsx**",
+            options=["(no seleccionado)"] + names,
+            index=0
+        )
+        fecha_override = st.date_input(
+            "FECHA_CORTE_OVERRIDE (opcional)",
+            value=None
+        )
+        fecha_override_iso = fecha_override.isoformat() if fecha_override else None
+
+    # Validar selección
+    selected = [modulo_central_name, proyeccion_name, importaciones_name]
+    if "(no seleccionado)" in selected:
+        st.warning("Seleccioná los 3 archivos requeridos para habilitar RUN.")
+        can_run = False
+    elif len(set(selected)) != 3:
+        st.error("No podés asignar el mismo archivo a más de un input. Corregí el mapeo.")
+        can_run = False
+    else:
+        can_run = True
+
+    run_clicked = st.button("🚀 RUN (FASE 2)", type="primary", disabled=not can_run)
+
+    if run_clicked:
+        created_at = now_ts()
+        run_id = make_run_id(created_at)
+        run_path = os.path.join(RUNS_DIR, run_id)
+        os.makedirs(run_path, exist_ok=False)
+
+        # Guardar inputs crudos
+        meta = save_uploaded_files(run_path, uploaded)
+
+        run_log = build_run_log_base(run_id, created_at, meta, fecha_override_iso)
+
+        # Resolver paths reales
+        name_to_path = {m["original_name"]: m["stored_path"] for m in meta}
+        modulo_central_path = name_to_path[modulo_central_name]
+        proyeccion_path = name_to_path[proyeccion_name]
+        importaciones_path = name_to_path[importaciones_name]
+
+        run_log["PARAMS_EFECTIVOS"]["MODULO_CENTRAL_PATH"] = modulo_central_path
+        run_log["PARAMS_EFECTIVOS"]["PROYECCION_PATH"] = proyeccion_path
+        run_log["PARAMS_EFECTIVOS"]["IMPORTACIONES_PATH"] = importaciones_path
+
+        # Ejecutar F2
+        all_issues: list[ValidationIssue] = []
+        try:
+            # Leer + validar stock y mtd
+            stock_df, mtd_df, issues = read_stock_and_mtd(modulo_central_path)
+            all_issues.extend(issues)
+
+            # Validación dura MTD por mes
+            fecha_corte_efectiva = datetime.fromisoformat(run_log["FECHA_CORTE_EFECTIVA"]).date()
+            all_issues.extend(validate_mtd_month(mtd_df, fecha_corte_efectiva))
+
+            # Proyección
+            proj_df, month_map, proj_issues = read_and_validate_projection(proyeccion_path, fecha_corte_efectiva)
+            all_issues.extend(proj_issues)
+
+            # Importaciones tránsito
+            transit_df, impo_issues = read_and_validate_transit(importaciones_path)
+            all_issues.extend(impo_issues)
+
+            # Conteos (auditables)
+            run_log["COUNTS"] = {
+                "STOCK_ROWS": int(len(stock_df)),
+                "MTD_ROWS": int(len(mtd_df)),
+                "PROJ_ROWS": int(len(proj_df)),
+                "TRANSIT_ROWS": int(len(transit_df)),
+                "PROJ_MONTH_COLS": int(len(month_map)),
+            }
+
+            # Persistir un reporte de validación (permitido en F2)
+            validation_report = {
+                "FECHA_CORTE_EFECTIVA": run_log["FECHA_CORTE_EFECTIVA"],
+                "VALIDATIONS": issues_to_dict(all_issues),
+                "MONTH_COLUMNS_MAP": {k: v.isoformat() for k, v in month_map.items()},
+            }
+            write_json(os.path.join(run_path, "validation_report.json"), validation_report)
+
+            run_log["VALIDATIONS"] = issues_to_dict(all_issues)
+            run_log["STATUS"] = "OK_F2"
+
+        except HardValidationError as he:
+            run_log["STATUS"] = "ERROR_F2"
+            run_log["VALIDATIONS"] = issues_to_dict(getattr(he, "issues", []))
+            run_log["ERRORS"] = ["Validaciones duras fallaron. Falla total (no se genera nada parcial)."]
+            write_json(os.path.join(run_path, "validation_report.json"), {
+                "FECHA_CORTE_EFECTIVA": run_log["FECHA_CORTE_EFECTIVA"],
+                "VALIDATIONS": run_log["VALIDATIONS"],
+            })
+
+        except Exception as e:
+            run_log["STATUS"] = "ERROR_F2"
+            run_log["ERRORS"] = [f"Error técnico inesperado: {str(e)}"]
+            write_json(os.path.join(run_path, "validation_report.json"), {
+                "FECHA_CORTE_EFECTIVA": run_log["FECHA_CORTE_EFECTIVA"],
+                "VALIDATIONS": run_log.get("VALIDATIONS", []),
+                "ERRORS": run_log["ERRORS"],
+            })
+
+        # Guardar run_log
+        write_json(os.path.join(run_path, "run_log.json"), run_log)
+
+        st.success(f"RUN generado: {run_id} — STATUS={run_log['STATUS']}")
+        st.json(run_log)
+
+        zip_bytes = make_zip_bytes(run_path)
+        st.download_button(
+            label="⬇️ Descargar ZIP del RUN (incluye run_log + validation_report + inputs)",
+            data=zip_bytes,
+            file_name=f"{run_id}.zip",
+            mime="application/zip"
+        )
+
+st.divider()
+st.subheader("Historial local (runs/)")
+runs = sorted([d for d in os.listdir(RUNS_DIR) if d.startswith("RUN_")], reverse=True)
+if not runs:
+    st.write("Todavía no hay RUNs.")
+else:
+    st.write(f"RUNs detectados: {len(runs)}")
+    st.code("\n".join(runs[:20]))
