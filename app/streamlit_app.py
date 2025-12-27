@@ -81,7 +81,7 @@ def issues_to_dict(issues: list[ValidationIssue]):
         "bad_count": i.bad_count,
         "code": i.code,
         "message": i.message,
-        "type": i.type,
+        "type": i.type,  # DATA_ERROR / TECH_ERROR
     } for i in issues]
 
 
@@ -90,6 +90,7 @@ def month_key(d: date) -> str:
 
 
 def to_json_safe_month_map(month_map: dict) -> dict:
+    # Evita keys datetime en JSON: key = YYYY-MM
     safe = {}
     for col_header, d in month_map.items():
         safe[month_key(d)] = {"date": d.isoformat(), "source_col_header": str(col_header)}
@@ -112,7 +113,7 @@ def build_run_log_base(run_id: str, created_at: datetime, input_files_meta, fech
         "ERRORS": [],
         "PARAMS_EFECTIVOS": {},
         "COUNTS": {},
-        "NOTES": "FASE 2: Lectura estricta y validaciones duras. Sin simulación ni outputs de negocio.",
+        "NOTES": "FASE 2: Lectura estricta y validaciones duras. NOTICES habilitado para auditoría.",
     }
 
 
@@ -129,11 +130,25 @@ def tech_issue(code: str, message: str):
     }
 
 
+def notice_issue(file: str, sheet: str, column: str | None, code: str, message: str):
+    # NOTICE con el MISMO contrato
+    return {
+        "file": file,
+        "sheet": sheet,
+        "column": column,
+        "bad_rows": [],
+        "bad_count": 0,
+        "code": code,
+        "message": message,
+        "type": "DATA_ERROR",
+    }
+
+
 st.set_page_config(page_title="IA Operativa — Módulo 2 (FASE 2)", layout="wide")
 ensure_dirs()
 
 st.title("IA Operativa — Módulo 2: Stock y Compras (FASE 2)")
-st.caption("FASE 2: Validaciones duras con trazabilidad completa (sin errores genéricos).")
+st.caption("FASE 2: Validaciones duras (falla total) + NOTICES trazables (audit).")
 
 uploaded = st.file_uploader("Subí los archivos (xlsx)", accept_multiple_files=True, type=["xlsx"])
 
@@ -179,16 +194,22 @@ if uploaded:
         validation_report = {
             "FECHA_CORTE_EFECTIVA": run_log["FECHA_CORTE_EFECTIVA"],
             "VALIDATIONS": [],
+            "NOTICES": [],
             "MONTH_COLUMNS_MAP": {},
         }
 
         try:
-            stock_df, mtd_df, _ = read_stock_and_mtd(modulo_central_path)
             fecha_corte_efectiva = datetime.fromisoformat(run_log["FECHA_CORTE_EFECTIVA"]).date()
-            validate_mtd_month(mtd_df, fecha_corte_efectiva, modulo_central_path)
-            proj_df, month_map, _ = read_and_validate_projection(proyeccion_path, fecha_corte_efectiva)
-            transit_df, _ = read_and_validate_transit(importaciones_path)
 
+            # Leer + validaciones duras
+            stock_df, mtd_df = read_stock_and_mtd(modulo_central_path)
+            validate_mtd_month(mtd_df, fecha_corte_efectiva, modulo_central_path)
+
+            proj_df, month_map, proj_notices = read_and_validate_projection(proyeccion_path, fecha_corte_efectiva)
+
+            transit_df = read_and_validate_transit(importaciones_path)
+
+            # Conteos auditables
             run_log["COUNTS"] = {
                 "STOCK_ROWS": int(len(stock_df)),
                 "MTD_ROWS": int(len(mtd_df)),
@@ -197,7 +218,63 @@ if uploaded:
                 "PROJ_MONTH_COLS": int(len(month_map)),
             }
 
+            # MONTH_COLUMNS_MAP (JSON-safe)
             validation_report["MONTH_COLUMNS_MAP"] = to_json_safe_month_map(month_map)
+
+            # NOTICES desde proyección (meses < MES_CORTE)
+            validation_report["NOTICES"].extend(issues_to_dict(proj_notices))
+
+            # =========================
+            # NOTICES adicionales (FASE 2)
+            # =========================
+            proj_skus = set(proj_df["SKU"].astype(str).str.strip().tolist())
+            stock_skus = set(stock_df["STOC_SKU"].astype(str).str.strip().tolist())
+            mtd_skus = set(mtd_df["SKU"].astype(str).str.strip().tolist())
+            transit_skus = set(transit_df["SKU"].astype(str).str.strip().tolist()) if len(transit_df) > 0 else set()
+
+            # (1) SKU en proyección sin stock informado -> asumir 0 (notice)
+            missing_stock = sorted(proj_skus - stock_skus)
+            for sku in missing_stock:
+                validation_report["NOTICES"].append(notice_issue(
+                    file=modulo_central_path,
+                    sheet="STOCK-2405-1426",
+                    column="STOC_SKU",
+                    code="STOCK_SKU_MISSING_ASSUME_0",
+                    message=f"SKU {sku} no tiene stock informado; se asumirá 0.",
+                ))
+
+            # (2) SKU fuera de proyección -> se ignora (notice) por origen
+            stock_out = sorted(stock_skus - proj_skus)
+            for sku in stock_out:
+                validation_report["NOTICES"].append(notice_issue(
+                    file=modulo_central_path,
+                    sheet="STOCK-2405-1426",
+                    column="STOC_SKU",
+                    code="SKU_OUTSIDE_PROJECTION_IGNORED",
+                    message=f"SKU {sku} está fuera de PROYECCION; será ignorado.",
+                ))
+
+            mtd_out = sorted(mtd_skus - proj_skus)
+            for sku in mtd_out:
+                validation_report["NOTICES"].append(notice_issue(
+                    file=modulo_central_path,
+                    sheet="REPORTE_DE_PEDIDOS-3978-1426",
+                    column="SKU",
+                    code="SKU_OUTSIDE_PROJECTION_IGNORED",
+                    message=f"SKU {sku} está fuera de PROYECCION; será ignorado.",
+                ))
+
+            transit_out = sorted(transit_skus - proj_skus)
+            for sku in transit_out:
+                validation_report["NOTICES"].append(notice_issue(
+                    file=importaciones_path,
+                    sheet="IMPORTACIONES",
+                    column="SKU",
+                    code="SKU_OUTSIDE_PROJECTION_IGNORED",
+                    message=f"SKU {sku} está fuera de PROYECCION; será ignorado.",
+                ))
+
+            # OK
             run_log["STATUS"] = "OK_F2"
 
         except HardValidationError as he:
@@ -212,8 +289,9 @@ if uploaded:
             validation_report["VALIDATIONS"] = [t]
             run_log["VALIDATIONS"] = [t]
             run_log["STATUS"] = "ERROR_F2"
-            run_log["ERRORS"] = ["Error técnico inesperado."]
+            run_log["ERRORS"] = ["Error técnico inesperado. Ver VALIDATIONS."]
 
+        # Persistir reportes
         write_json(os.path.join(run_path, "validation_report.json"), validation_report)
         write_json(os.path.join(run_path, "run_log.json"), run_log)
 
