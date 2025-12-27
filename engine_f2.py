@@ -1,298 +1,330 @@
-import os
-import io
-import json
-import zipfile
-from datetime import datetime, date
-import hashlib
-import secrets
-import streamlit as st
+from __future__ import annotations
 
-from engine_f2 import (
-    HardValidationError,
-    ValidationIssue,
-    read_stock_and_mtd,
-    validate_mtd_month,
-    read_and_validate_projection,
-    read_and_validate_transit,
-)
+from dataclasses import dataclass
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional, Tuple
 
-RUNS_DIR = "runs"
+import pandas as pd
 
 
-def ensure_dirs():
-    os.makedirs(RUNS_DIR, exist_ok=True)
+# =========================
+# Helpers (fechas)
+# =========================
+
+def _month_start(d: date) -> date:
+    return date(d.year, d.month, 1)
 
 
-def now_ts():
-    return datetime.now()
+def _is_month_start(d: date) -> bool:
+    return d.day == 1
 
 
-def make_run_id(dt: datetime) -> str:
-    return f"RUN_{dt.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(4)}"
-
-
-def sha256_bytes(b: bytes) -> str:
-    return hashlib.sha256(b).hexdigest()
-
-
-def save_uploaded_files(run_path: str, uploaded_files):
-    inputs_dir = os.path.join(run_path, "inputs")
-    os.makedirs(inputs_dir, exist_ok=True)
-
-    saved = []
-    for uf in uploaded_files:
-        content = uf.getvalue()
-        file_hash = sha256_bytes(content)
-        dst = os.path.join(inputs_dir, uf.name)
-
-        with open(dst, "wb") as f:
-            f.write(content)
-
-        saved.append({
-            "original_name": uf.name,
-            "size_bytes": len(content),
-            "sha256": file_hash,
-            "stored_path": dst.replace("\\", "/"),
-        })
-    return saved
-
-
-def build_run_log_base(run_id: str, created_at: datetime, input_files_meta, fecha_corte_override_iso: str | None):
-    fecha_corte_default = created_at.date().isoformat()
-    fecha_corte_efectiva = fecha_corte_override_iso or fecha_corte_default
-    return {
-        "RUN_ID": run_id,
-        "CREATED_AT": created_at.isoformat(timespec="seconds"),
-        "FECHA_CORTE_DEFAULT": fecha_corte_default,
-        "FECHA_CORTE_OVERRIDE": fecha_corte_override_iso,
-        "FECHA_CORTE_EFECTIVA": fecha_corte_efectiva,
-        "OVERRIDE_ACTIVO": bool(fecha_corte_override_iso),
-        "INPUT_FILES": input_files_meta,
-        "STATUS": None,
-        "VALIDATIONS": [],
-        "ERRORS": [],
-        "PARAMS_EFECTIVOS": {},
-        "COUNTS": {},
-        "NOTES": "FASE 2: Lectura estricta y validaciones duras. Sin simulación ni outputs de negocio.",
-    }
-
-
-def write_json(path: str, obj: dict):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-
-
-def make_zip_bytes(run_path: str) -> bytes:
-    mem = io.BytesIO()
-    with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        for root, _, files in os.walk(run_path):
-            for fn in files:
-                full = os.path.join(root, fn)
-                rel = os.path.relpath(full, run_path)
-                z.write(full, arcname=rel.replace("\\", "/"))
-    mem.seek(0)
-    return mem.read()
-
-
-def issues_to_dict(issues: list[ValidationIssue]):
-    # Garantiza el contrato de trazabilidad en JSON
-    out = []
-    for i in issues:
-        out.append({
-            "file": i.file,
-            "sheet": i.sheet,
-            "column": i.column,
-            "bad_rows": i.bad_rows,
-            "bad_count": i.bad_count,
-            "code": i.code,
-            "message": i.message,
-            "type": i.type,  # DATA_ERROR / TECH_ERROR
-        })
-    return out
-
-
-def month_key(d: date) -> str:
-    return f"{d.year:04d}-{d.month:02d}"
-
-
-def to_json_safe_month_map(month_map: dict) -> dict:
-    """
-    Evita keys datetime en JSON:
-    - key: YYYY-MM (string)
-    - value: date iso + header original string
-    """
-    safe = {}
-    for col_header, d in month_map.items():
-        k = month_key(d)
-        safe[k] = {
-            "date": d.isoformat(),
-            "source_col_header": str(col_header)
-        }
-    return safe
-
-
-def make_tech_issue(file: str, sheet: str, column: str | None, code: str, message: str) -> dict:
-    # Incluso TECH_ERROR cumple el contrato completo (sin inferencias).
-    return {
-        "file": file,
-        "sheet": sheet,
-        "column": column,
-        "bad_rows": [],
-        "bad_count": 0,
-        "code": code,
-        "message": message,
-        "type": "TECH_ERROR",
-    }
-
-
-st.set_page_config(page_title="IA Operativa — Módulo 2 (FASE 2)", layout="wide")
-ensure_dirs()
-
-st.title("IA Operativa — Módulo 2: Stock y Compras (FASE 2)")
-st.caption("FASE 2: Lectura estricta de inputs + Validaciones duras (falla total) con trazabilidad completa.")
-
-uploaded = st.file_uploader(
-    "Subí los archivos del Módulo 2 (xlsx). En FASE 2 se validan estrictamente.",
-    accept_multiple_files=True,
-    type=["xlsx"]
-)
-
-if uploaded and len(uploaded) > 0:
-    st.subheader("Mapeo de archivos (obligatorio en FASE 2)")
-    names = [u.name for u in uploaded]
-
-    colA, colB = st.columns(2)
-
-    with colA:
-        modulo_central_name = st.selectbox(
-            "Seleccioná el archivo que corresponde a **Modulo Central.xlsx**",
-            options=["(no seleccionado)"] + names,
-            index=0
-        )
-        proyeccion_name = st.selectbox(
-            "Seleccioná el archivo que corresponde a **PROYECCION - SKU  MAYO 2026.xlsx**",
-            options=["(no seleccionado)"] + names,
-            index=0
-        )
-
-    with colB:
-        importaciones_name = st.selectbox(
-            "Seleccioná el archivo que corresponde a **Importaciones (1).xlsx**",
-            options=["(no seleccionado)"] + names,
-            index=0
-        )
-        fecha_override = st.date_input(
-            "FECHA_CORTE_OVERRIDE (opcional)",
-            value=None
-        )
-        fecha_override_iso = fecha_override.isoformat() if fecha_override else None
-
-    selected = [modulo_central_name, proyeccion_name, importaciones_name]
-    if "(no seleccionado)" in selected:
-        st.warning("Seleccioná los 3 archivos requeridos para habilitar RUN.")
-        can_run = False
-    elif len(set(selected)) != 3:
-        st.error("No podés asignar el mismo archivo a más de un input. Corregí el mapeo.")
-        can_run = False
-    else:
-        can_run = True
-
-    run_clicked = st.button("🚀 RUN (FASE 2)", type="primary", disabled=not can_run)
-
-    if run_clicked:
-        created_at = now_ts()
-        run_id = make_run_id(created_at)
-        run_path = os.path.join(RUNS_DIR, run_id)
-        os.makedirs(run_path, exist_ok=False)
-
-        meta = save_uploaded_files(run_path, uploaded)
-        run_log = build_run_log_base(run_id, created_at, meta, fecha_override_iso)
-
-        name_to_path = {m["original_name"]: m["stored_path"] for m in meta}
-        modulo_central_path = name_to_path[modulo_central_name]
-        proyeccion_path = name_to_path[proyeccion_name]
-        importaciones_path = name_to_path[importaciones_name]
-
-        run_log["PARAMS_EFECTIVOS"]["MODULO_CENTRAL_PATH"] = modulo_central_path
-        run_log["PARAMS_EFECTIVOS"]["PROYECCION_PATH"] = proyeccion_path
-        run_log["PARAMS_EFECTIVOS"]["IMPORTACIONES_PATH"] = importaciones_path
-
-        all_issues: list[ValidationIssue] = []
-        validation_report = {
-            "FECHA_CORTE_EFECTIVA": run_log["FECHA_CORTE_EFECTIVA"],
-            "VALIDATIONS": [],
-            "MONTH_COLUMNS_MAP": {},
-        }
-
+def _parse_excel_date_header(col) -> Optional[date]:
+    if isinstance(col, datetime):
+        return col.date()
+    if isinstance(col, date):
+        return col
+    if isinstance(col, str):
+        s = col.strip()
+        if not s:
+            return None
         try:
-            stock_df, mtd_df, issues = read_stock_and_mtd(modulo_central_path)
-            all_issues.extend(issues)
+            dt = pd.to_datetime(s, errors="raise")
+            if pd.isna(dt):
+                return None
+            return dt.to_pydatetime().date()
+        except Exception:
+            return None
+    return None
 
-            fecha_corte_efectiva = datetime.fromisoformat(run_log["FECHA_CORTE_EFECTIVA"]).date()
-            all_issues.extend(validate_mtd_month(mtd_df, fecha_corte_efectiva, modulo_central_path))
 
-            proj_df, month_map, proj_issues = read_and_validate_projection(proyeccion_path, fecha_corte_efectiva)
-            all_issues.extend(proj_issues)
+# =========================
+# Trazabilidad de errores
+# =========================
 
-            transit_df, impo_issues = read_and_validate_transit(importaciones_path)
-            all_issues.extend(impo_issues)
+@dataclass
+class ValidationIssue:
+    file: str
+    sheet: str
+    column: str | None
+    bad_rows: list[int]
+    bad_count: int
+    code: str
+    message: str
+    type: str  # "DATA_ERROR" | "TECH_ERROR"
 
-            run_log["COUNTS"] = {
-                "STOCK_ROWS": int(len(stock_df)),
-                "MTD_ROWS": int(len(mtd_df)),
-                "PROJ_ROWS": int(len(proj_df)),
-                "TRANSIT_ROWS": int(len(transit_df)),
-                "PROJ_MONTH_COLS": int(len(month_map)),
-            }
 
-            validation_report["VALIDATIONS"] = issues_to_dict(all_issues)
-            validation_report["MONTH_COLUMNS_MAP"] = to_json_safe_month_map(month_map)
+class HardValidationError(Exception):
+    def __init__(self, issues: List[ValidationIssue]):
+        super().__init__("Hard validations failed.")
+        self.issues = issues
 
-            run_log["VALIDATIONS"] = validation_report["VALIDATIONS"]
-            run_log["STATUS"] = "OK_F2"
 
-        except HardValidationError as he:
-            # Falla total, pero con trazabilidad completa.
-            run_log["STATUS"] = "ERROR_F2"
-            run_log["VALIDATIONS"] = issues_to_dict(getattr(he, "issues", []))
-            run_log["ERRORS"] = ["Validaciones duras fallaron. Falla total (no se genera nada parcial)."]
+def _issue(
+    *,
+    file: str,
+    sheet: str,
+    column: str | None,
+    bad_rows: list[int] | None,
+    code: str,
+    message: str,
+    type_: str,
+) -> ValidationIssue:
+    rows = bad_rows or []
+    return ValidationIssue(
+        file=file,
+        sheet=sheet,
+        column=column,
+        bad_rows=rows,
+        bad_count=len(rows),
+        code=code,
+        message=message,
+        type=type_,
+    )
 
-            validation_report["VALIDATIONS"] = run_log["VALIDATIONS"]
 
+def _df_bad_rows(df: pd.DataFrame, mask: pd.Series) -> list[int]:
+    if mask is None or mask.empty:
+        return []
+    return df.index[mask].tolist()
+
+
+# =========================
+# Lectura + Validaciones (FASE 2)
+# =========================
+
+def read_stock_and_mtd(modulo_central_path: str) -> Tuple[pd.DataFrame, pd.DataFrame, List[ValidationIssue]]:
+    issues: List[ValidationIssue] = []
+
+    # STOCK
+    try:
+        stock = pd.read_excel(modulo_central_path, sheet_name="STOCK-2405-1426", engine="openpyxl")
+    except Exception as e:
+        issues.append(_issue(
+            file=modulo_central_path, sheet="STOCK-2405-1426", column=None, bad_rows=[],
+            code="STOCK_SHEET_READ_FAIL", message=f"No se pudo leer hoja STOCK-2405-1426: {str(e)}", type_="TECH_ERROR"
+        ))
+        raise HardValidationError(issues)
+
+    for col in ["STOC_SKU", "STOC_CANTIDAD"]:
+        if col not in stock.columns:
+            issues.append(_issue(
+                file=modulo_central_path, sheet="STOCK-2405-1426", column=col, bad_rows=[],
+                code="STOCK_COL_MISSING", message=f"Falta columna obligatoria en STOCK: {col}", type_="DATA_ERROR"
+            ))
+    if issues:
+        raise HardValidationError(issues)
+
+    stock = stock.copy()
+    stock["STOC_SKU"] = stock["STOC_SKU"].astype(str).str.strip()
+
+    qty = pd.to_numeric(stock["STOC_CANTIDAD"], errors="coerce")
+    mask_neg = qty.fillna(0) < 0
+    bad_rows = _df_bad_rows(stock, mask_neg)
+    if bad_rows:
+        issues.append(_issue(
+            file=modulo_central_path, sheet="STOCK-2405-1426", column="STOC_CANTIDAD", bad_rows=bad_rows,
+            code="STOCK_NEGATIVE", message="STOC_CANTIDAD tiene valores negativos (prohibido).", type_="DATA_ERROR"
+        ))
+        raise HardValidationError(issues)
+
+    stock["STOC_CANTIDAD"] = qty.fillna(0)
+
+    # MTD
+    try:
+        mtd = pd.read_excel(modulo_central_path, sheet_name="REPORTE_DE_PEDIDOS-3978-1426", engine="openpyxl")
+    except Exception as e:
+        issues.append(_issue(
+            file=modulo_central_path, sheet="REPORTE_DE_PEDIDOS-3978-1426", column=None, bad_rows=[],
+            code="MTD_SHEET_READ_FAIL", message=f"No se pudo leer hoja REPORTE_DE_PEDIDOS-3978-1426: {str(e)}", type_="TECH_ERROR"
+        ))
+        raise HardValidationError(issues)
+
+    for col in ["FECHA_DESPACHO", "SKU", "CANTIDAD"]:
+        if col not in mtd.columns:
+            issues.append(_issue(
+                file=modulo_central_path, sheet="REPORTE_DE_PEDIDOS-3978-1426", column=col, bad_rows=[],
+                code="MTD_COL_MISSING", message=f"Falta columna obligatoria en MTD: {col}", type_="DATA_ERROR"
+            ))
+    if issues:
+        raise HardValidationError(issues)
+
+    mtd = mtd.copy()
+    mtd["SKU"] = mtd["SKU"].astype(str).str.strip()
+
+    parsed = pd.to_datetime(mtd["FECHA_DESPACHO"], errors="coerce")
+    mask_bad_date = parsed.isna()
+    bad_rows = _df_bad_rows(mtd, mask_bad_date)
+    if bad_rows:
+        issues.append(_issue(
+            file=modulo_central_path, sheet="REPORTE_DE_PEDIDOS-3978-1426", column="FECHA_DESPACHO", bad_rows=bad_rows,
+            code="MTD_DATE_PARSE", message="FECHA_DESPACHO contiene fechas no parseables.", type_="DATA_ERROR"
+        ))
+        raise HardValidationError(issues)
+
+    mtd["FECHA_DESPACHO"] = parsed
+    mtd["CANTIDAD"] = pd.to_numeric(mtd["CANTIDAD"], errors="coerce").fillna(0)
+
+    return stock, mtd, []
+
+
+def validate_mtd_month(mtd: pd.DataFrame, fecha_corte_efectiva: date, modulo_central_path: str) -> List[ValidationIssue]:
+    mes_corte = _month_start(fecha_corte_efectiva)
+    mask_bad = mtd["FECHA_DESPACHO"].dt.to_period("M") != pd.Period(mes_corte, freq="M")
+    bad_rows = _df_bad_rows(mtd, mask_bad)
+    if bad_rows:
+        raise HardValidationError([_issue(
+            file=modulo_central_path, sheet="REPORTE_DE_PEDIDOS-3978-1426", column="FECHA_DESPACHO", bad_rows=bad_rows,
+            code="MTD_MONTH_MISMATCH",
+            message=f"MTD contiene despachos fuera del mes de FECHA_CORTE_EFECTIVA ({mes_corte.isoformat()}).",
+            type_="DATA_ERROR"
+        )])
+    return []
+
+
+def read_and_validate_projection(proyeccion_path: str, fecha_corte_efectiva: date) -> Tuple[pd.DataFrame, Dict[Any, date], List[ValidationIssue]]:
+    try:
+        df = pd.read_excel(proyeccion_path, sheet_name="GENERAL", engine="openpyxl")
+    except Exception as e:
+        raise HardValidationError([_issue(
+            file=proyeccion_path, sheet="GENERAL", column=None, bad_rows=[],
+            code="PROJ_SHEET_READ_FAIL", message=f"No se pudo leer hoja GENERAL: {str(e)}", type_="TECH_ERROR"
+        )])
+
+    issues: List[ValidationIssue] = []
+    for col in ["GRUPO", "SKU"]:
+        if col not in df.columns:
+            issues.append(_issue(
+                file=proyeccion_path, sheet="GENERAL", column=col, bad_rows=[],
+                code="PROJ_COL_MISSING", message=f"Falta columna base obligatoria en PROYECCION: {col}", type_="DATA_ERROR"
+            ))
+    if issues:
+        raise HardValidationError(issues)
+
+    df = df.copy()
+    df["SKU"] = df["SKU"].astype(str).str.strip()
+    df["GRUPO"] = df["GRUPO"].astype(str).str.strip()
+
+    mask_dup = df["SKU"].duplicated(keep=False)
+    bad_rows = _df_bad_rows(df, mask_dup)
+    if bad_rows:
+        raise HardValidationError([_issue(
+            file=proyeccion_path, sheet="GENERAL", column="SKU", bad_rows=bad_rows,
+            code="PROJ_SKU_DUP", message="SKU duplicado en PROYECCION (prohibido).", type_="DATA_ERROR"
+        )])
+
+    month_cols = [c for c in df.columns if c not in ["GRUPO", "SKU"]]
+    if not month_cols:
+        raise HardValidationError([_issue(
+            file=proyeccion_path, sheet="GENERAL", column=None, bad_rows=[],
+            code="PROJ_NO_MONTH_COLS", message="No se detectaron columnas de meses en PROYECCION.", type_="DATA_ERROR"
+        )])
+
+    parsed_months: List[Tuple[Any, date]] = []
+    for c in month_cols:
+        d = _parse_excel_date_header(c)
+        if d is None:
+            raise HardValidationError([_issue(
+                file=proyeccion_path, sheet="GENERAL", column=str(c), bad_rows=[],
+                code="PROJ_MONTH_PARSE", message="Columna de mes no parseable como fecha (header inválido).", type_="DATA_ERROR"
+            )])
+        if not _is_month_start(d):
+            raise HardValidationError([_issue(
+                file=proyeccion_path, sheet="GENERAL", column=str(c), bad_rows=[],
+                code="PROJ_MONTH_NOT_FIRST_DAY", message=f"Columna de mes no es primer día del mes: {d.isoformat()}", type_="DATA_ERROR"
+            )])
+        parsed_months.append((c, d))
+
+    dates_only = [d for _, d in parsed_months]
+    if len(set(dates_only)) != len(dates_only):
+        raise HardValidationError([_issue(
+            file=proyeccion_path, sheet="GENERAL", column=None, bad_rows=[],
+            code="PROJ_MONTH_DUP", message="Existen meses duplicados en columnas de PROYECCION (misma fecha repetida).", type_="DATA_ERROR"
+        )])
+
+    parsed_months.sort(key=lambda x: x[1])
+
+    mes_corte = _month_start(fecha_corte_efectiva)
+    active_months = [d for _, d in parsed_months if d >= mes_corte]
+    if not active_months:
+        raise HardValidationError([_issue(
+            file=proyeccion_path, sheet="GENERAL", column=None, bad_rows=[],
+            code="PROJ_NO_ACTIVE_MONTHS", message=f"No hay meses de proyección en/desde MES_CORTE={mes_corte.isoformat()}", type_="DATA_ERROR"
+        )])
+
+    min_m, max_m = min(active_months), max(active_months)
+    expected = []
+    cur = min_m
+    while cur <= max_m:
+        expected.append(cur)
+        y = cur.year + (cur.month // 12)
+        m = (cur.month % 12) + 1
+        cur = date(y, m, 1)
+
+    if set(expected) != set(active_months):
+        missing_months = sorted(set(expected) - set(active_months))
+        raise HardValidationError([_issue(
+            file=proyeccion_path, sheet="GENERAL", column=None, bad_rows=[],
+            code="PROJ_MONTH_GAP",
+            message=f"Falta(n) mes(es) intermedio(s) en proyección: {[d.isoformat() for d in missing_months]}",
+            type_="DATA_ERROR"
+        )])
+
+    for c, _d in parsed_months:
+        mask_null = df[c].isna()
+        bad_rows = _df_bad_rows(df, mask_null)
+        if bad_rows:
+            raise HardValidationError([_issue(
+                file=proyeccion_path, sheet="GENERAL", column=str(c), bad_rows=bad_rows,
+                code="PROJ_DEMAND_NULL", message="Demanda NULL/vacía detectada (prohibido).", type_="DATA_ERROR"
+            )])
+
+    for c, _d in parsed_months:
+        try:
+            df[c] = pd.to_numeric(df[c], errors="raise")
         except Exception as e:
-            # TECH_ERROR estructurado (sin genéricos)
-            run_log["STATUS"] = "ERROR_F2"
-            tech = make_tech_issue(
-                file="(runtime)",
-                sheet="(runtime)",
-                column=None,
-                code="TECH_UNEXPECTED",
-                message=str(e),
-            )
-            run_log["VALIDATIONS"] = [tech]
-            run_log["ERRORS"] = ["Error técnico inesperado. Ver VALIDATIONS para trazabilidad."]
-            validation_report["VALIDATIONS"] = [tech]
+            raise HardValidationError([_issue(
+                file=proyeccion_path, sheet="GENERAL", column=str(c), bad_rows=[],
+                code="PROJ_DEMAND_NOT_NUMERIC", message=f"Demanda no numérica: {str(e)}", type_="DATA_ERROR"
+            )])
+        df[c] = df[c].round().astype(int)
 
-        # Persistir reportes
-        write_json(os.path.join(run_path, "validation_report.json"), validation_report)
-        write_json(os.path.join(run_path, "run_log.json"), run_log)
+    month_map = {col: d for col, d in parsed_months}
+    return df, month_map, []
 
-        st.success(f"RUN generado: {run_id} — STATUS={run_log['STATUS']}")
-        st.json(run_log)
 
-        zip_bytes = make_zip_bytes(run_path)
-        st.download_button(
-            label="⬇️ Descargar ZIP del RUN (incluye run_log + validation_report + inputs)",
-            data=zip_bytes,
-            file_name=f"{run_id}.zip",
-            mime="application/zip"
-        )
+def read_and_validate_transit(importaciones_path: str) -> Tuple[pd.DataFrame, List[ValidationIssue]]:
+    try:
+        df = pd.read_excel(importaciones_path, sheet_name="IMPORTACIONES", engine="openpyxl")
+    except Exception as e:
+        raise HardValidationError([_issue(
+            file=importaciones_path, sheet="IMPORTACIONES", column=None, bad_rows=[],
+            code="IMPO_SHEET_READ_FAIL", message=f"No se pudo leer hoja IMPORTACIONES: {str(e)}", type_="TECH_ERROR"
+        )])
 
-st.divider()
-st.subheader("Historial local (runs/)")
-runs = sorted([d for d in os.listdir(RUNS_DIR) if d.startswith("RUN_")], reverse=True)
-if not runs:
-    st.write("Todavía no hay RUNs.")
-else:
-    st.write(f"RUNs detectados: {len(runs)}")
-    st.code("\n".join(runs[:20]))
+    issues: List[ValidationIssue] = []
+    for col in ["ESTATUS", "SKU", "Cantidad", "ETA"]:
+        if col not in df.columns:
+            issues.append(_issue(
+                file=importaciones_path, sheet="IMPORTACIONES", column=col, bad_rows=[],
+                code="IMPO_COL_MISSING", message=f"Falta columna obligatoria en IMPORTACIONES: {col}", type_="DATA_ERROR"
+            ))
+    if issues:
+        raise HardValidationError(issues)
+
+    df = df.copy()
+    df["SKU"] = df["SKU"].astype(str).str.strip()
+    df = df.loc[df["ESTATUS"].astype(str).str.strip() == "Tránsito"].copy()
+
+    parsed_eta = pd.to_datetime(df["ETA"], errors="coerce")
+    mask_bad_eta = parsed_eta.isna()
+    bad_rows = _df_bad_rows(df, mask_bad_eta)
+    if bad_rows:
+        raise HardValidationError([_issue(
+            file=importaciones_path, sheet="IMPORTACIONES", column="ETA", bad_rows=bad_rows,
+            code="IMPO_ETA_PARSE", message="ETA contiene fechas no parseables en filas Tránsito.", type_="DATA_ERROR"
+        )])
+
+    df["ETA"] = parsed_eta
+    df["Cantidad"] = pd.to_numeric(df["Cantidad"], errors="coerce").fillna(0)
+    return df, []
