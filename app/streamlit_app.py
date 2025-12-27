@@ -282,7 +282,6 @@ if uploaded:
             validation_report["VALIDATIONS"] = errs
             run_log["VALIDATIONS"] = errs
             run_log["STATUS"] = "ERROR_F2"
-            run_log["ERRORS"] = ["Validaciones duras fallaron. Falla total."]
 
         except Exception as e:
             t = tech_issue("TECH_UNEXPECTED", str(e))
