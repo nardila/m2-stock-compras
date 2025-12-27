@@ -17,7 +17,10 @@ from engine_f2 import (
     read_and_validate_transit,
 )
 
-from engine_f3 import simulate_f3_1_baseline
+from engine_f3 import (
+    simulate_f3_1_baseline,
+    plan_purchase_f3_2_default120,
+)
 
 RUNS_DIR = "runs"
 
@@ -118,10 +121,11 @@ def build_run_log_base(run_id: str, created_at: datetime, input_files_meta, fech
         "VALIDATIONS": [],
         "PARAMS_EFECTIVOS": {},
         "COUNTS": {},
-        "NOTES": "FASE 2/3: Validaciones duras + F3.1 simulación baseline (sin compras).",
+        "NOTES": "F2: validaciones duras. F3.1: simulación baseline. F3.2: plan de compra (default LT=120).",
         "F3": {
             "STATUS": None,
-            "KPIS": {},
+            "KPIS_F3_1": {},
+            "KPIS_F3_2": {},
         },
     }
 
@@ -143,7 +147,7 @@ st.set_page_config(page_title="IA Operativa — Módulo 2 (FASE 2/3)", layout="w
 ensure_dirs()
 
 st.title("IA Operativa — Módulo 2: Stock y Compras (FASE 2/3)")
-st.caption("F2: validaciones duras. F3.1: simulación baseline diaria con decimales (sin compras).")
+st.caption("F2: validaciones duras. F3.1: simulación baseline. F3.2: plan compra default LT=120, cobertura=30 post-llegada.")
 
 uploaded = st.file_uploader("Subí los archivos (xlsx)", accept_multiple_files=True, type=["xlsx"])
 
@@ -156,7 +160,7 @@ if uploaded:
         proyeccion_name = st.selectbox("PROYECCION - SKU  MAYO 2026.xlsx", ["(no seleccionado)"] + names, 0)
 
     with b:
-        importaciones_name = st.selectbox("Importaciones (1).xlsx", ["(no seleccionado)"] + names, 0)
+        importaciones_name = st.selectbox("Importaciones.xlsx", ["(no seleccionado)"] + names, 0)
         fecha_override = st.date_input("FECHA_CORTE_OVERRIDE (opcional)", value=None)
         fecha_override_iso = fecha_override.isoformat() if fecha_override else None
 
@@ -165,8 +169,12 @@ if uploaded:
 
     mode = st.radio(
         "Modo de ejecución",
-        ["FASE 2 (solo validaciones)", "FASE 3.1 (simulación baseline sin compras)"],
-        index=1,
+        [
+            "FASE 2 (solo validaciones)",
+            "FASE 3.1 (simulación baseline sin compras)",
+            "FASE 3.2 (plan de compra default LT=120)",
+        ],
+        index=2,
         horizontal=True,
         disabled=not can_run
     )
@@ -223,12 +231,12 @@ if uploaded:
 
             validation_report["MONTH_COLUMNS_MAP"] = to_json_safe_month_map(month_map)
             validation_report["NOTICES"].extend(issues_to_dict(proj_notices))
-
             run_log["STATUS"] = "OK_F2"
 
-            # ===== FASE 3.1 =====
-            if mode.startswith("FASE 3.1"):
-                sim_df, kpis, f3_notices = simulate_f3_1_baseline(
+            # ===== F3.1 =====
+            sim_df = None
+            if mode.startswith("FASE 3.1") or mode.startswith("FASE 3.2"):
+                sim_df, kpis_1, f3_notices_1 = simulate_f3_1_baseline(
                     stock_df=stock_df,
                     mtd_df=mtd_df,
                     proj_df=proj_df,
@@ -238,18 +246,26 @@ if uploaded:
                     importaciones_path=importaciones_path,
                     fecha_corte=fecha_corte_efectiva,
                 )
-
-                # NOTICES F3 (mismo contrato)
-                validation_report["NOTICES"].extend(issues_to_dict(f3_notices))
-
-                # Outputs
+                validation_report["NOTICES"].extend(issues_to_dict(f3_notices_1))
                 if sim_df is not None and len(sim_df) > 0:
                     write_csv(os.path.join(outputs_dir, "simulation_daily.csv"), sim_df)
-
-                write_json(os.path.join(outputs_dir, "kpis.json"), kpis)
-
+                write_json(os.path.join(outputs_dir, "kpis_f3_1.json"), kpis_1)
+                run_log["F3"]["KPIS_F3_1"] = kpis_1
                 run_log["F3"]["STATUS"] = "OK_F3_1"
-                run_log["F3"]["KPIS"] = kpis
+
+            # ===== F3.2 =====
+            if mode.startswith("FASE 3.2"):
+                plan_df, kpis_2, f3_notices_2 = plan_purchase_f3_2_default120(
+                    simulation_df=sim_df,
+                    fecha_corte=fecha_corte_efectiva,
+                    proyeccion_path=proyeccion_path,
+                )
+                validation_report["NOTICES"].extend(issues_to_dict(f3_notices_2))
+                if plan_df is not None and len(plan_df) > 0:
+                    write_csv(os.path.join(outputs_dir, "purchase_plan.csv"), plan_df)
+                write_json(os.path.join(outputs_dir, "kpis_f3_2.json"), kpis_2)
+                run_log["F3"]["KPIS_F3_2"] = kpis_2
+                run_log["F3"]["STATUS"] = "OK_F3_2"
 
         except HardValidationError as he:
             errs = issues_to_dict(getattr(he, "issues", []))
