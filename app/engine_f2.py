@@ -10,7 +10,6 @@ import pandas as pd
 # Reutilizamos el contrato de F2 (para mantener consistencia)
 # En F3.1 no vamos a tirar HardValidationError por reglas de negocio nuevas;
 # Si faltan inputs canónicos, eso ya lo frena F2.
-from engine_f2 import ValidationIssue, _issue
 
 
 LEAD_TIME_DEFAULT_DAYS = 120  # v1.4 (calendario)
