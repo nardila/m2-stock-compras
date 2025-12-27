@@ -1,299 +1,371 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
-from typing import Dict, List, Tuple
+from dataclasses import dataclass
+from datetime import date, datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
-# Reutilizamos contrato/issue de F2
-from engine_f2 import ValidationIssue, _issue
 
-LEAD_TIME_DEFAULT_DAYS = 120  # v1.4 (calendario)
-BUFFER_ETA_DIAS_DEFAULT = 7   # v1.4
-COVERAGE_DAYS = 30            # v1.4 (no configurable)
-
+# =========================
+# Helpers (fechas)
+# =========================
 
 def _month_start(d: date) -> date:
     return date(d.year, d.month, 1)
 
 
-def _month_end(d: date) -> date:
-    if d.month == 12:
-        nxt = date(d.year + 1, 1, 1)
-    else:
-        nxt = date(d.year, d.month + 1, 1)
-    return nxt - timedelta(days=1)
+def _is_month_start(d: date) -> bool:
+    return d.day == 1
 
 
-def _daterange(d0: date, d1: date) -> List[date]:
-    days = (d1 - d0).days
-    return [d0 + timedelta(days=i) for i in range(days + 1)]
-
-
-def _safe_strip_series(s: pd.Series) -> pd.Series:
-    return s.astype(str).str.strip()
-
-
-def _pick_col(df: pd.DataFrame, candidates: List[str]) -> str:
-    """Devuelve la primera columna existente en df dentro de candidates, o levanta KeyError."""
-    for c in candidates:
-        if c in df.columns:
-            return c
-    raise KeyError(f"No se encontró ninguna de estas columnas: {candidates}. Disponibles: {list(df.columns)}")
-
-
-def _build_daily_demand_decimal(
-    proj_df: pd.DataFrame,
-    mtd_df: pd.DataFrame,
-    fecha_corte: date,
-) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    # Identificar columnas de meses en proj_df
-    month_cols: List[Tuple[object, date]] = []
-    for c in proj_df.columns:
-        if c in ("GRUPO", "SKU"):
-            continue
+def _parse_excel_date_header(col) -> Optional[date]:
+    if isinstance(col, datetime):
+        return col.date()
+    if isinstance(col, date):
+        return col
+    if isinstance(col, str):
+        s = col.strip()
+        if not s:
+            return None
         try:
-            d = pd.to_datetime(str(c)).date()
-            month_cols.append((c, date(d.year, d.month, 1)))
+            dt = pd.to_datetime(s, errors="raise")
+            if pd.isna(dt):
+                return None
+            return dt.to_pydatetime().date()
         except Exception:
-            continue
-
-    if not month_cols:
-        for c in proj_df.columns:
-            if c in ("GRUPO", "SKU"):
-                continue
-            if isinstance(c, datetime):
-                d = c.date()
-                month_cols.append((c, date(d.year, d.month, 1)))
-            elif isinstance(c, date):
-                month_cols.append((c, date(c.year, c.month, 1)))
-
-    # De-dup + sort
-    month_cols = list({(str(col), d): (col, d) for col, d in month_cols}.values())
-    month_cols.sort(key=lambda x: x[1])
-
-    mes_corte = _month_start(fecha_corte)
-    month_cols = [(col, d) for col, d in month_cols if d >= mes_corte]
-
-    # MTD agregado por SKU
-    mtd = mtd_df.copy()
-    mtd["SKU"] = _safe_strip_series(mtd["SKU"])
-    mtd["CANTIDAD"] = pd.to_numeric(mtd["CANTIDAD"], errors="coerce").fillna(0.0)
-    mtd_by_sku = mtd.groupby("SKU", as_index=True)["CANTIDAD"].sum().to_dict()
-
-    rows = []
-    totals_by_sku: Dict[str, float] = {}
-
-    for _, r in proj_df.iterrows():
-        sku = str(r["SKU"]).strip()
-
-        for col, m0 in month_cols:
-            m_end = _month_end(m0)
-            projected_month = float(r[col])
-
-            if m0 == mes_corte:
-                ventas_mtd = float(mtd_by_sku.get(sku, 0.0))
-                demanda_mes = max(0.0, projected_month - ventas_mtd)
-                d0 = fecha_corte
-                d1 = m_end
-            else:
-                demanda_mes = projected_month
-                d0 = m0
-                d1 = m_end
-
-            days = (d1 - d0).days + 1
-            if days <= 0:
-                continue
-
-            demand_daily = demanda_mes / float(days)
-
-            for d in _daterange(d0, d1):
-                rows.append({"date": d, "SKU": sku, "demand": demand_daily})
-                totals_by_sku[sku] = totals_by_sku.get(sku, 0.0) + demand_daily
-
-    dd = pd.DataFrame(rows)
-    if dd.empty:
-        return dd, totals_by_sku
-
-    dd["date"] = pd.to_datetime(dd["date"])
-    dd["SKU"] = _safe_strip_series(dd["SKU"])
-    dd["demand"] = dd["demand"].astype(float)
-    return dd, totals_by_sku
+            return None
+    return None
 
 
-def _build_inbound_schedule(
-    transit_df: pd.DataFrame,
-    fecha_corte: date,
-    horizon_end: date,
-    buffer_eta_days: int = BUFFER_ETA_DIAS_DEFAULT,
-) -> pd.DataFrame:
-    if transit_df is None or len(transit_df) == 0:
-        return pd.DataFrame(columns=["date", "SKU", "qty"])
+# =========================
+# Trazabilidad de errores / notices
+# =========================
 
-    t = transit_df.copy()
-    t["SKU"] = _safe_strip_series(t["SKU"])
-    t["Cantidad"] = pd.to_numeric(t["Cantidad"], errors="coerce").fillna(0.0)
-    t["ETA"] = pd.to_datetime(t["ETA"], errors="coerce")
-
-    t = t.dropna(subset=["ETA"])
-    t["date"] = t["ETA"] + pd.to_timedelta(buffer_eta_days, unit="D")
-    t["date"] = t["date"].dt.normalize()
-
-    d0 = pd.to_datetime(fecha_corte)
-    d1 = pd.to_datetime(horizon_end)
-    t = t[(t["date"] >= d0) & (t["date"] <= d1)].copy()
-
-    inbound = (
-        t.groupby(["date", "SKU"], as_index=False)["Cantidad"]
-        .sum()
-        .rename(columns={"Cantidad": "qty"})
-    )
-    return inbound
+@dataclass
+class ValidationIssue:
+    file: str
+    sheet: str
+    column: str | None
+    bad_rows: list[int]
+    bad_count: int
+    code: str
+    message: str
+    type: str  # "DATA_ERROR" | "TECH_ERROR"
 
 
-def simulate_f3_1_baseline(
+class HardValidationError(Exception):
+    def __init__(self, issues: List[ValidationIssue]):
+        super().__init__("Hard validations failed.")
+        self.issues = issues
+
+
+def _issue(
     *,
-    stock_df: pd.DataFrame,
-    mtd_df: pd.DataFrame,
-    proj_df: pd.DataFrame,
-    transit_df: pd.DataFrame,
-    proyeccion_path: str,
-    modulo_central_path: str,
-    importaciones_path: str,
-    fecha_corte: date,
-) -> Tuple[pd.DataFrame, dict, List[ValidationIssue]]:
-    notices: List[ValidationIssue] = []
+    file: str,
+    sheet: str,
+    column: str | None,
+    bad_rows: list[int] | None,
+    code: str,
+    message: str,
+    type_: str,
+) -> ValidationIssue:
+    rows = bad_rows or []
+    return ValidationIssue(
+        file=file,
+        sheet=sheet,
+        column=column,
+        bad_rows=rows,
+        bad_count=len(rows),
+        code=code,
+        message=message,
+        type=type_,
+    )
 
-    # Horizonte por último mes en proyección
-    month_dates = []
-    for c in proj_df.columns:
-        if c in ("GRUPO", "SKU"):
-            continue
-        try:
-            d = pd.to_datetime(str(c)).date()
-            month_dates.append(date(d.year, d.month, 1))
-        except Exception:
-            if isinstance(c, (datetime, date)):
-                d = c.date() if isinstance(c, datetime) else c
-                month_dates.append(date(d.year, d.month, 1))
 
-    month_dates = sorted(set([d for d in month_dates if d >= _month_start(fecha_corte)]))
-    if not month_dates:
-        notices.append(_issue(
-            file=proyeccion_path, sheet="GENERAL", column="(STRUCTURE)", bad_rows=[],
-            code="F3_NO_ACTIVE_MONTHS",
-            message="F3.1: no se detectaron meses activos >= MES_CORTE para simular.",
-            type_="TECH_ERROR"
+def _df_bad_rows(df: pd.DataFrame, mask: pd.Series) -> list[int]:
+    if mask is None or mask.empty:
+        return []
+    return df.index[mask].tolist()
+
+
+# =========================
+# Lectura + Validaciones duras (FASE 2)
+# =========================
+
+def read_stock_and_mtd(modulo_central_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    issues: List[ValidationIssue] = []
+
+    # STOCK
+    try:
+        stock = pd.read_excel(modulo_central_path, sheet_name="STOCK-2405-1426", engine="openpyxl")
+    except Exception as e:
+        issues.append(_issue(
+            file=modulo_central_path, sheet="STOCK-2405-1426", column=None, bad_rows=[],
+            code="STOCK_SHEET_READ_FAIL", message=f"No se pudo leer hoja STOCK-2405-1426: {str(e)}", type_="TECH_ERROR"
         ))
-        return pd.DataFrame(), {"status": "NO_DATA"}, notices
+        raise HardValidationError(issues)
 
-    horizon_end = _month_end(month_dates[-1])
+    for col in ["STOC_SKU", "STOC_CANTIDAD"]:
+        if col not in stock.columns:
+            issues.append(_issue(
+                file=modulo_central_path, sheet="STOCK-2405-1426", column=col, bad_rows=[],
+                code="STOCK_COL_MISSING", message=f"Falta columna obligatoria en STOCK: {col}", type_="DATA_ERROR"
+            ))
+    if issues:
+        raise HardValidationError(issues)
 
-    daily_demand_df, _totals = _build_daily_demand_decimal(proj_df, mtd_df, fecha_corte)
-    if daily_demand_df.empty:
-        notices.append(_issue(
-            file=proyeccion_path, sheet="GENERAL", column="(STRUCTURE)", bad_rows=[],
-            code="F3_EMPTY_DAILY_DEMAND",
-            message="F3.1: demanda diaria vacía (no hay filas).",
-            type_="TECH_ERROR"
-        ))
-        return pd.DataFrame(), {"status": "NO_DATA"}, notices
+    stock = stock.copy()
+    stock["STOC_SKU"] = stock["STOC_SKU"].astype(str).str.strip()
 
-    inbound_df = _build_inbound_schedule(transit_df, fecha_corte, horizon_end, BUFFER_ETA_DIAS_DEFAULT)
+    qty = pd.to_numeric(stock["STOC_CANTIDAD"], errors="coerce")
+    mask_neg = qty.fillna(0) < 0
+    bad_rows = _df_bad_rows(stock, mask_neg)
+    if bad_rows:
+        raise HardValidationError([_issue(
+            file=modulo_central_path, sheet="STOCK-2405-1426", column="STOC_CANTIDAD", bad_rows=bad_rows,
+            code="STOCK_NEGATIVE", message="STOC_CANTIDAD tiene valores negativos (prohibido).", type_="DATA_ERROR"
+        )])
 
-    proj_skus = set(_safe_strip_series(proj_df["SKU"]).tolist())
+    stock["STOC_CANTIDAD"] = qty.fillna(0)
 
-    # ✅ FIX: tolerar ambos esquemas de stock_df (STOC_* o SKU/STOCK)
-    st = stock_df.copy()
-    sku_col = _pick_col(st, ["STOC_SKU", "SKU"])
-    qty_col = _pick_col(st, ["STOC_CANTIDAD", "STOCK", "CANTIDAD"])
+    # MTD
+    try:
+        mtd = pd.read_excel(modulo_central_path, sheet_name="REPORTE_DE_PEDIDOS-3978-1426", engine="openpyxl")
+    except Exception as e:
+        raise HardValidationError([_issue(
+            file=modulo_central_path, sheet="REPORTE_DE_PEDIDOS-3978-1426", column=None, bad_rows=[],
+            code="MTD_SHEET_READ_FAIL", message=f"No se pudo leer hoja REPORTE_DE_PEDIDOS-3978-1426: {str(e)}", type_="TECH_ERROR"
+        )])
 
-    st[sku_col] = _safe_strip_series(st[sku_col])
-    st[qty_col] = pd.to_numeric(st[qty_col], errors="coerce").fillna(0.0)
-    stock_map = st.groupby(sku_col, as_index=True)[qty_col].sum().to_dict()
+    issues = []
+    for col in ["FECHA_DESPACHO", "SKU", "CANTIDAD"]:
+        if col not in mtd.columns:
+            issues.append(_issue(
+                file=modulo_central_path, sheet="REPORTE_DE_PEDIDOS-3978-1426", column=col, bad_rows=[],
+                code="MTD_COL_MISSING", message=f"Falta columna obligatoria en MTD: {col}", type_="DATA_ERROR"
+            ))
+    if issues:
+        raise HardValidationError(issues)
 
-    missing_stock = sorted(proj_skus - set(stock_map.keys()))
-    for sku in missing_stock:
-        notices.append(_issue(
-            file=modulo_central_path, sheet="STOCK-2405-1426", column=sku_col, bad_rows=[],
-            code="STOCK_SKU_MISSING_ASSUME_0",
-            message=f"F3.1: SKU {sku} no tiene stock informado; se asume 0.",
+    mtd = mtd.copy()
+    mtd["SKU"] = mtd["SKU"].astype(str).str.strip()
+
+    parsed = pd.to_datetime(mtd["FECHA_DESPACHO"], errors="coerce")
+    mask_bad_date = parsed.isna()
+    bad_rows = _df_bad_rows(mtd, mask_bad_date)
+    if bad_rows:
+        raise HardValidationError([_issue(
+            file=modulo_central_path, sheet="REPORTE_DE_PEDIDOS-3978-1426", column="FECHA_DESPACHO", bad_rows=bad_rows,
+            code="MTD_DATE_PARSE", message="FECHA_DESPACHO contiene fechas no parseables.", type_="DATA_ERROR"
+        )])
+
+    mtd["FECHA_DESPACHO"] = parsed
+    mtd["CANTIDAD"] = pd.to_numeric(mtd["CANTIDAD"], errors="coerce").fillna(0)
+    return stock, mtd
+
+
+def validate_mtd_month(mtd: pd.DataFrame, fecha_corte_efectiva: date, modulo_central_path: str) -> None:
+    mes_corte = _month_start(fecha_corte_efectiva)
+    mask_bad = mtd["FECHA_DESPACHO"].dt.to_period("M") != pd.Period(mes_corte, freq="M")
+    bad_rows = _df_bad_rows(mtd, mask_bad)
+    if bad_rows:
+        raise HardValidationError([_issue(
+            file=modulo_central_path, sheet="REPORTE_DE_PEDIDOS-3978-1426", column="FECHA_DESPACHO", bad_rows=bad_rows,
+            code="MTD_MONTH_MISMATCH",
+            message=f"MTD contiene despachos fuera del mes de FECHA_CORTE_EFECTIVA ({mes_corte.isoformat()}).",
             type_="DATA_ERROR"
-        ))
+        )])
 
-    dd = daily_demand_df[daily_demand_df["SKU"].isin(proj_skus)].copy()
 
-    all_days = pd.date_range(pd.to_datetime(fecha_corte), pd.to_datetime(horizon_end), freq="D")
-    base = pd.MultiIndex.from_product([all_days, sorted(proj_skus)], names=["date", "SKU"]).to_frame(index=False)
+def read_and_validate_projection(
+    proyeccion_path: str,
+    fecha_corte_efectiva: date
+) -> Tuple[pd.DataFrame, Dict[Any, date], List[ValidationIssue]]:
+    """
+    Devuelve:
+      - df proyección validado
+      - month_map {col_header_original: date}
+      - notices (meses < MES_CORTE ignorados)
+    """
+    try:
+        df = pd.read_excel(proyeccion_path, sheet_name="GENERAL", engine="openpyxl")
+    except Exception as e:
+        raise HardValidationError([_issue(
+            file=proyeccion_path, sheet="GENERAL", column=None, bad_rows=[],
+            code="PROJ_SHEET_READ_FAIL", message=f"No se pudo leer hoja GENERAL: {str(e)}", type_="TECH_ERROR"
+        )])
 
-    dd = dd.groupby(["date", "SKU"], as_index=False)["demand"].sum()
-    sim = base.merge(dd, on=["date", "SKU"], how="left")
-    sim["demand"] = sim["demand"].fillna(0.0)
+    issues: List[ValidationIssue] = []
+    for col in ["GRUPO", "SKU"]:
+        if col not in df.columns:
+            issues.append(_issue(
+                file=proyeccion_path, sheet="GENERAL", column=col, bad_rows=[],
+                code="PROJ_COL_MISSING", message=f"Falta columna base obligatoria en PROYECCION: {col}", type_="DATA_ERROR"
+            ))
+    if issues:
+        raise HardValidationError(issues)
 
-    if inbound_df is None or inbound_df.empty:
-        sim["inbound"] = 0.0
-    else:
-        inbound_df2 = inbound_df.copy()
-        inbound_df2["date"] = pd.to_datetime(inbound_df2["date"])
-        inbound_df2["SKU"] = _safe_strip_series(inbound_df2["SKU"])
-        inbound_df2["qty"] = pd.to_numeric(inbound_df2["qty"], errors="coerce").fillna(0.0)
-        inbound_df2 = inbound_df2.groupby(["date", "SKU"], as_index=False)["qty"].sum()
-        sim = sim.merge(inbound_df2.rename(columns={"qty": "inbound"}), on=["date", "SKU"], how="left")
-        sim["inbound"] = sim["inbound"].fillna(0.0)
+    df = df.copy()
+    df["SKU"] = df["SKU"].astype(str).str.strip()
+    df["GRUPO"] = df["GRUPO"].astype(str).str.strip()
 
-    out_rows = []
+    # SKU duplicado
+    mask_dup = df["SKU"].duplicated(keep=False)
+    bad_rows = _df_bad_rows(df, mask_dup)
+    if bad_rows:
+        raise HardValidationError([_issue(
+            file=proyeccion_path, sheet="GENERAL", column="SKU", bad_rows=bad_rows,
+            code="PROJ_SKU_DUP", message="SKU duplicado en PROYECCION (prohibido).", type_="DATA_ERROR"
+        )])
 
-    for sku in sorted(proj_skus):
-        sku_sim = sim[sim["SKU"] == sku].sort_values("date").copy()
+    # Columnas de meses
+    month_cols = [c for c in df.columns if c not in ["GRUPO", "SKU"]]
+    if not month_cols:
+        raise HardValidationError([_issue(
+            file=proyeccion_path, sheet="GENERAL", column=None, bad_rows=[],
+            code="PROJ_NO_MONTH_COLS", message="No se detectaron columnas de meses en PROYECCION.", type_="DATA_ERROR"
+        )])
 
-        on_hand = float(stock_map.get(sku, 0.0))
+    parsed_months: List[Tuple[Any, date]] = []
+    for c in month_cols:
+        d = _parse_excel_date_header(c)
+        if d is None:
+            raise HardValidationError([_issue(
+                file=proyeccion_path, sheet="GENERAL", column=str(c), bad_rows=[],
+                code="PROJ_MONTH_PARSE", message="Columna de mes no parseable como fecha (header inválido).", type_="DATA_ERROR"
+            )])
+        if not _is_month_start(d):
+            raise HardValidationError([_issue(
+                file=proyeccion_path, sheet="GENERAL", column=str(c), bad_rows=[],
+                code="PROJ_MONTH_NOT_FIRST_DAY", message=f"Columna de mes no es primer día del mes: {d.isoformat()}", type_="DATA_ERROR"
+            )])
+        parsed_months.append((c, d))
 
-        for _, r in sku_sim.iterrows():
-            d = r["date"]
-            demand = float(r["demand"])
-            inbound = float(r["inbound"])
+    # Duplicados por fecha -> evidencia por columna
+    date_to_cols: Dict[date, List[Any]] = {}
+    for c, d in parsed_months:
+        date_to_cols.setdefault(d, []).append(c)
 
-            on_hand_start = on_hand
-            on_hand_mid = on_hand_start + inbound
+    dup_issues: List[ValidationIssue] = []
+    for d, cols in date_to_cols.items():
+        if len(cols) > 1:
+            cols_str = [str(x) for x in cols]
+            for col_header in cols:
+                dup_issues.append(_issue(
+                    file=proyeccion_path,
+                    sheet="GENERAL",
+                    column=str(col_header),
+                    bad_rows=[],
+                    code="PROJ_MONTH_DUP",
+                    message=f"Mes duplicado {d.isoformat()} en columnas: {cols_str}",
+                    type_="DATA_ERROR",
+                ))
+    if dup_issues:
+        raise HardValidationError(dup_issues)
 
-            fulfilled = min(demand, on_hand_mid)
-            lost = max(0.0, demand - fulfilled)
+    parsed_months.sort(key=lambda x: x[1])
 
-            on_hand_end = on_hand_mid - fulfilled
-            if on_hand_end < 0:
-                on_hand_end = 0.0  # cap en cero (v1.4)
+    # NOTICES: meses anteriores a MES_CORTE ignorados
+    mes_corte = _month_start(fecha_corte_efectiva)
+    notices: List[ValidationIssue] = []
+    for col_header, d in parsed_months:
+        if d < mes_corte:
+            notices.append(_issue(
+                file=proyeccion_path,
+                sheet="GENERAL",
+                column=str(col_header),
+                bad_rows=[],
+                code="PROJ_MONTH_IGNORED",
+                message=f"Mes {d.isoformat()} anterior a MES_CORTE={mes_corte.isoformat()}; será ignorado.",
+                type_="DATA_ERROR",
+            ))
 
-            out_rows.append({
-                "date": d.date().isoformat(),
-                "SKU": sku,
-                "on_hand_start": on_hand_start,
-                "inbound": inbound,
-                "demand": demand,
-                "fulfilled": fulfilled,
-                "lost_sales": lost,
-                "on_hand_end": on_hand_end,
-            })
+    # Contigüidad desde MES_CORTE
+    active_months = [d for _, d in parsed_months if d >= mes_corte]
+    if not active_months:
+        raise HardValidationError([_issue(
+            file=proyeccion_path, sheet="GENERAL", column=None, bad_rows=[],
+            code="PROJ_NO_ACTIVE_MONTHS", message=f"No hay meses de proyección en/desde MES_CORTE={mes_corte.isoformat()}",
+            type_="DATA_ERROR"
+        )])
 
-            on_hand = on_hand_end
+    min_m, max_m = min(active_months), max(active_months)
+    expected = []
+    cur = min_m
+    while cur <= max_m:
+        expected.append(cur)
+        y = cur.year + (cur.month // 12)
+        m = (cur.month % 12) + 1
+        cur = date(y, m, 1)
 
-    out = pd.DataFrame(out_rows)
+    if set(expected) != set(active_months):
+        missing_months = sorted(set(expected) - set(active_months))
+        raise HardValidationError([_issue(
+            file=proyeccion_path, sheet="GENERAL", column="(STRUCTURE)", bad_rows=[],
+            code="PROJ_MONTH_GAP",
+            message=f"Falta(n) mes(es) intermedio(s) en proyección: {[d.isoformat() for d in missing_months]}",
+            type_="DATA_ERROR"
+        )])
 
-    total_demand = float(out["demand"].sum()) if len(out) else 0.0
-    total_fulfilled = float(out["fulfilled"].sum()) if len(out) else 0.0
-    total_lost = float(out["lost_sales"].sum()) if len(out) else 0.0
-    fill_rate = (total_fulfilled / total_demand) if total_demand > 0 else 1.0
+    # Demanda NULL/vacía -> error (0 válido)
+    for c, _d in parsed_months:
+        mask_null = df[c].isna()
+        bad_rows = _df_bad_rows(df, mask_null)
+        if bad_rows:
+            raise HardValidationError([_issue(
+                file=proyeccion_path, sheet="GENERAL", column=str(c), bad_rows=bad_rows,
+                code="PROJ_DEMAND_NULL", message="Demanda NULL/vacía detectada (prohibido).", type_="DATA_ERROR"
+            )])
 
-    kpis = {
-        "F3_STAGE": "F3_1_BASELINE",
-        "FECHA_CORTE_EFECTIVA": fecha_corte.isoformat(),
-        "HORIZON_END": horizon_end.isoformat(),
-        "BUFFER_ETA_DIAS": BUFFER_ETA_DIAS_DEFAULT,
-        "LEAD_TIME_DEFAULT_DAYS": LEAD_TIME_DEFAULT_DAYS,
-        "COVERAGE_DAYS": COVERAGE_DAYS,
-        "TOTAL_DEMAND": total_demand,
-        "TOTAL_FULFILLED": total_fulfilled,
-        "TOTAL_LOST_SALES": total_lost,
-        "FILL_RATE": fill_rate,
-    }
+    # Demanda numérica + redondeo v1.4
+    for c, _d in parsed_months:
+        try:
+            df[c] = pd.to_numeric(df[c], errors="raise")
+        except Exception as e:
+            raise HardValidationError([_issue(
+                file=proyeccion_path, sheet="GENERAL", column=str(c), bad_rows=[],
+                code="PROJ_DEMAND_NOT_NUMERIC", message=f"Demanda no numérica: {str(e)}", type_="DATA_ERROR"
+            )])
+        df[c] = df[c].round().astype(int)
 
-    return out, kpis, notices
+    month_map = {col: d for col, d in parsed_months}
+    return df, month_map, notices
+
+
+def read_and_validate_transit(importaciones_path: str) -> pd.DataFrame:
+    try:
+        df = pd.read_excel(importaciones_path, sheet_name="IMPORTACIONES", engine="openpyxl")
+    except Exception as e:
+        raise HardValidationError([_issue(
+            file=importaciones_path, sheet="IMPORTACIONES", column=None, bad_rows=[],
+            code="IMPO_SHEET_READ_FAIL", message=f"No se pudo leer hoja IMPORTACIONES: {str(e)}", type_="TECH_ERROR"
+        )])
+
+    issues: List[ValidationIssue] = []
+    for col in ["ESTATUS", "SKU", "Cantidad", "ETA"]:
+        if col not in df.columns:
+            issues.append(_issue(
+                file=importaciones_path, sheet="IMPORTACIONES", column=col, bad_rows=[],
+                code="IMPO_COL_MISSING", message=f"Falta columna obligatoria en IMPORTACIONES: {col}", type_="DATA_ERROR"
+            ))
+    if issues:
+        raise HardValidationError(issues)
+
+    df = df.copy()
+    df["SKU"] = df["SKU"].astype(str).str.strip()
+
+    df = df.loc[df["ESTATUS"].astype(str).str.strip() == "Tránsito"].copy()
+
+    parsed_eta = pd.to_datetime(df["ETA"], errors="coerce")
+    mask_bad_eta = parsed_eta.isna()
+    bad_rows = _df_bad_rows(df, mask_bad_eta)
+    if bad_rows:
+        raise HardValidationError([_issue(
+            file=importaciones_path, sheet="IMPORTACIONES", column="ETA", bad_rows=bad_rows,
+            code="IMPO_ETA_PARSE", message="ETA contiene fechas no parseables en filas Tránsito.", type_="DATA_ERROR"
+        )])
+
+    df["ETA"] = parsed_eta
+    df["Cantidad"] = pd.to_numeric(df["Cantidad"], errors="coerce").fillna(0)
+    return df
