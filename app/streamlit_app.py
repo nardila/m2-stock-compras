@@ -44,10 +44,8 @@ def save_uploaded_files(run_path: str, uploaded_files):
         content = uf.getvalue()
         file_hash = sha256_bytes(content)
         dst = os.path.join(inputs_dir, uf.name)
-
         with open(dst, "wb") as f:
             f.write(content)
-
         saved.append({
             "original_name": uf.name,
             "size_bytes": len(content),
@@ -55,6 +53,47 @@ def save_uploaded_files(run_path: str, uploaded_files):
             "stored_path": dst.replace("\\", "/"),
         })
     return saved
+
+
+def write_json(path: str, obj: dict):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def make_zip_bytes(run_path: str) -> bytes:
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for root, _, files in os.walk(run_path):
+            for fn in files:
+                full = os.path.join(root, fn)
+                rel = os.path.relpath(full, run_path)
+                z.write(full, arcname=rel.replace("\\", "/"))
+    mem.seek(0)
+    return mem.read()
+
+
+def issues_to_dict(issues: list[ValidationIssue]):
+    return [{
+        "file": i.file,
+        "sheet": i.sheet,
+        "column": i.column,
+        "bad_rows": i.bad_rows,
+        "bad_count": i.bad_count,
+        "code": i.code,
+        "message": i.message,
+        "type": i.type,
+    } for i in issues]
+
+
+def month_key(d: date) -> str:
+    return f"{d.year:04d}-{d.month:02d}"
+
+
+def to_json_safe_month_map(month_map: dict) -> dict:
+    safe = {}
+    for col_header, d in month_map.items():
+        safe[month_key(d)] = {"date": d.isoformat(), "source_col_header": str(col_header)}
+    return safe
 
 
 def build_run_log_base(run_id: str, created_at: datetime, input_files_meta, fecha_corte_override_iso: str | None):
@@ -77,107 +116,47 @@ def build_run_log_base(run_id: str, created_at: datetime, input_files_meta, fech
     }
 
 
-def write_json(path: str, obj: dict):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-
-
-def make_zip_bytes(run_path: str) -> bytes:
-    mem = io.BytesIO()
-    with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        for root, _, files in os.walk(run_path):
-            for fn in files:
-                full = os.path.join(root, fn)
-                rel = os.path.relpath(full, run_path)
-                z.write(full, arcname=rel.replace("\\", "/"))
-    mem.seek(0)
-    return mem.read()
-
-
-def issues_to_dict(issues: list[ValidationIssue]):
-    return [{"level": i.level, "code": i.code, "message": i.message} for i in issues]
-
-
-def month_key(d: date) -> str:
-    # Clave canónica de mes para JSON: YYYY-MM
-    return f"{d.year:04d}-{d.month:02d}"
-
-
-def to_json_safe_month_map(month_map: dict) -> dict:
-    """
-    FIX técnico:
-    - month_map viene como {col_header: date} y col_header puede ser datetime/date (no serializable como key en JSON).
-    - Convertimos SIEMPRE la key a string (YYYY-MM) y metemos el header original como string dentro del value.
-    """
-    safe = {}
-    for col_header, d in month_map.items():
-        k = month_key(d)  # YYYY-MM (estándar, estable)
-        safe[k] = {
-            "date": d.isoformat(),          # YYYY-MM-DD
-            "source_col_header": str(col_header)  # auditabilidad sin romper JSON
-        }
-    return safe
+def tech_issue(code: str, message: str):
+    return {
+        "file": "(runtime)",
+        "sheet": "(runtime)",
+        "column": None,
+        "bad_rows": [],
+        "bad_count": 0,
+        "code": code,
+        "message": message,
+        "type": "TECH_ERROR",
+    }
 
 
 st.set_page_config(page_title="IA Operativa — Módulo 2 (FASE 2)", layout="wide")
 ensure_dirs()
 
 st.title("IA Operativa — Módulo 2: Stock y Compras (FASE 2)")
-st.caption("FASE 2: Lectura estricta de inputs + Validaciones duras (falla total).")
+st.caption("FASE 2: Validaciones duras con trazabilidad completa (sin errores genéricos).")
 
-with st.expander("📌 Estado de fase", expanded=True):
-    st.write("- **FASE 2 activa**: se leen inputs según v1.4 y se validan. Si hay error, **no se produce nada parcial**.")
-    st.write("- No hay simulación ni outputs (#1/#2/#3). Eso es FASE 3.")
+uploaded = st.file_uploader("Subí los archivos (xlsx)", accept_multiple_files=True, type=["xlsx"])
 
-uploaded = st.file_uploader(
-    "Subí los archivos del Módulo 2 (xlsx). En FASE 2 se validan estrictamente.",
-    accept_multiple_files=True,
-    type=["xlsx"]
-)
-
-if uploaded and len(uploaded) > 0:
-    st.subheader("Mapeo de archivos (obligatorio en FASE 2)")
+if uploaded:
     names = [u.name for u in uploaded]
+    a, b = st.columns(2)
 
-    colA, colB = st.columns(2)
+    with a:
+        modulo_central_name = st.selectbox("Modulo Central.xlsx", ["(no seleccionado)"] + names, 0)
+        proyeccion_name = st.selectbox("PROYECCION - SKU  MAYO 2026.xlsx", ["(no seleccionado)"] + names, 0)
 
-    with colA:
-        modulo_central_name = st.selectbox(
-            "Seleccioná el archivo que corresponde a **Modulo Central.xlsx**",
-            options=["(no seleccionado)"] + names,
-            index=0
-        )
-        proyeccion_name = st.selectbox(
-            "Seleccioná el archivo que corresponde a **PROYECCION - SKU  MAYO 2026.xlsx**",
-            options=["(no seleccionado)"] + names,
-            index=0
-        )
-
-    with colB:
-        importaciones_name = st.selectbox(
-            "Seleccioná el archivo que corresponde a **Importaciones (1).xlsx**",
-            options=["(no seleccionado)"] + names,
-            index=0
-        )
-        fecha_override = st.date_input(
-            "FECHA_CORTE_OVERRIDE (opcional)",
-            value=None
-        )
+    with b:
+        importaciones_name = st.selectbox("Importaciones (1).xlsx", ["(no seleccionado)"] + names, 0)
+        fecha_override = st.date_input("FECHA_CORTE_OVERRIDE (opcional)", value=None)
         fecha_override_iso = fecha_override.isoformat() if fecha_override else None
 
     selected = [modulo_central_name, proyeccion_name, importaciones_name]
-    if "(no seleccionado)" in selected:
-        st.warning("Seleccioná los 3 archivos requeridos para habilitar RUN.")
-        can_run = False
-    elif len(set(selected)) != 3:
-        st.error("No podés asignar el mismo archivo a más de un input. Corregí el mapeo.")
-        can_run = False
-    else:
-        can_run = True
+    can_run = "(no seleccionado)" not in selected and len(set(selected)) == 3
 
-    run_clicked = st.button("🚀 RUN (FASE 2)", type="primary", disabled=not can_run)
+    if not can_run:
+        st.warning("Mapeo incompleto o repetido. Corregí para habilitar RUN.")
 
-    if run_clicked:
+    if st.button("🚀 RUN (FASE 2)", type="primary", disabled=not can_run):
         created_at = now_ts()
         run_id = make_run_id(created_at)
         run_path = os.path.join(RUNS_DIR, run_id)
@@ -191,23 +170,24 @@ if uploaded and len(uploaded) > 0:
         proyeccion_path = name_to_path[proyeccion_name]
         importaciones_path = name_to_path[importaciones_name]
 
-        run_log["PARAMS_EFECTIVOS"]["MODULO_CENTRAL_PATH"] = modulo_central_path
-        run_log["PARAMS_EFECTIVOS"]["PROYECCION_PATH"] = proyeccion_path
-        run_log["PARAMS_EFECTIVOS"]["IMPORTACIONES_PATH"] = importaciones_path
+        run_log["PARAMS_EFECTIVOS"] = {
+            "MODULO_CENTRAL_PATH": modulo_central_path,
+            "PROYECCION_PATH": proyeccion_path,
+            "IMPORTACIONES_PATH": importaciones_path,
+        }
 
-        all_issues: list[ValidationIssue] = []
+        validation_report = {
+            "FECHA_CORTE_EFECTIVA": run_log["FECHA_CORTE_EFECTIVA"],
+            "VALIDATIONS": [],
+            "MONTH_COLUMNS_MAP": {},
+        }
+
         try:
-            stock_df, mtd_df, issues = read_stock_and_mtd(modulo_central_path)
-            all_issues.extend(issues)
-
+            stock_df, mtd_df, _ = read_stock_and_mtd(modulo_central_path)
             fecha_corte_efectiva = datetime.fromisoformat(run_log["FECHA_CORTE_EFECTIVA"]).date()
-            all_issues.extend(validate_mtd_month(mtd_df, fecha_corte_efectiva))
-
-            proj_df, month_map, proj_issues = read_and_validate_projection(proyeccion_path, fecha_corte_efectiva)
-            all_issues.extend(proj_issues)
-
-            transit_df, impo_issues = read_and_validate_transit(importaciones_path)
-            all_issues.extend(impo_issues)
+            validate_mtd_month(mtd_df, fecha_corte_efectiva, modulo_central_path)
+            proj_df, month_map, _ = read_and_validate_projection(proyeccion_path, fecha_corte_efectiva)
+            transit_df, _ = read_and_validate_transit(importaciones_path)
 
             run_log["COUNTS"] = {
                 "STOCK_ROWS": int(len(stock_df)),
@@ -217,53 +197,27 @@ if uploaded and len(uploaded) > 0:
                 "PROJ_MONTH_COLS": int(len(month_map)),
             }
 
-            # FIX: month_map puede tener keys datetime -> convertir a string antes de serializar
-            validation_report = {
-                "FECHA_CORTE_EFECTIVA": run_log["FECHA_CORTE_EFECTIVA"],
-                "VALIDATIONS": issues_to_dict(all_issues),
-                "MONTH_COLUMNS_MAP": to_json_safe_month_map(month_map),
-            }
-            write_json(os.path.join(run_path, "validation_report.json"), validation_report)
-
-            run_log["VALIDATIONS"] = issues_to_dict(all_issues)
+            validation_report["MONTH_COLUMNS_MAP"] = to_json_safe_month_map(month_map)
             run_log["STATUS"] = "OK_F2"
 
         except HardValidationError as he:
+            errs = issues_to_dict(getattr(he, "issues", []))
+            validation_report["VALIDATIONS"] = errs
+            run_log["VALIDATIONS"] = errs
             run_log["STATUS"] = "ERROR_F2"
-            run_log["VALIDATIONS"] = issues_to_dict(getattr(he, "issues", []))
-            run_log["ERRORS"] = ["Validaciones duras fallaron. Falla total (no se genera nada parcial)."]
-            write_json(os.path.join(run_path, "validation_report.json"), {
-                "FECHA_CORTE_EFECTIVA": run_log["FECHA_CORTE_EFECTIVA"],
-                "VALIDATIONS": run_log["VALIDATIONS"],
-            })
+            run_log["ERRORS"] = ["Validaciones duras fallaron. Falla total."]
 
         except Exception as e:
+            t = tech_issue("TECH_UNEXPECTED", str(e))
+            validation_report["VALIDATIONS"] = [t]
+            run_log["VALIDATIONS"] = [t]
             run_log["STATUS"] = "ERROR_F2"
-            run_log["ERRORS"] = [f"Error técnico inesperado: {str(e)}"]
-            write_json(os.path.join(run_path, "validation_report.json"), {
-                "FECHA_CORTE_EFECTIVA": run_log["FECHA_CORTE_EFECTIVA"],
-                "VALIDATIONS": run_log.get("VALIDATIONS", []),
-                "ERRORS": run_log["ERRORS"],
-            })
+            run_log["ERRORS"] = ["Error técnico inesperado."]
 
+        write_json(os.path.join(run_path, "validation_report.json"), validation_report)
         write_json(os.path.join(run_path, "run_log.json"), run_log)
 
-        st.success(f"RUN generado: {run_id} — STATUS={run_log['STATUS']}")
+        st.success(f"RUN: {run_id} — {run_log['STATUS']}")
         st.json(run_log)
 
-        zip_bytes = make_zip_bytes(run_path)
-        st.download_button(
-            label="⬇️ Descargar ZIP del RUN (incluye run_log + validation_report + inputs)",
-            data=zip_bytes,
-            file_name=f"{run_id}.zip",
-            mime="application/zip"
-        )
-
-st.divider()
-st.subheader("Historial local (runs/)")
-runs = sorted([d for d in os.listdir(RUNS_DIR) if d.startswith("RUN_")], reverse=True)
-if not runs:
-    st.write("Todavía no hay RUNs.")
-else:
-    st.write(f"RUNs detectados: {len(runs)}")
-    st.code("\n".join(runs[:20]))
+        st.download_button("⬇️ Descargar ZIP", data=make_zip_bytes(run_path), file_name=f"{run_id}.zip", mime="application/zip")
