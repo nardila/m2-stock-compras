@@ -39,7 +39,7 @@ def _parse_excel_date_header(col) -> Optional[date]:
 
 
 # =========================
-# Trazabilidad de errores
+# Trazabilidad de errores / notices
 # =========================
 
 @dataclass
@@ -90,10 +90,10 @@ def _df_bad_rows(df: pd.DataFrame, mask: pd.Series) -> list[int]:
 
 
 # =========================
-# Lectura + Validaciones (FASE 2)
+# Lectura + Validaciones duras (FASE 2)
 # =========================
 
-def read_stock_and_mtd(modulo_central_path: str) -> Tuple[pd.DataFrame, pd.DataFrame, List[ValidationIssue]]:
+def read_stock_and_mtd(modulo_central_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     issues: List[ValidationIssue] = []
 
     # STOCK
@@ -122,11 +122,10 @@ def read_stock_and_mtd(modulo_central_path: str) -> Tuple[pd.DataFrame, pd.DataF
     mask_neg = qty.fillna(0) < 0
     bad_rows = _df_bad_rows(stock, mask_neg)
     if bad_rows:
-        issues.append(_issue(
+        raise HardValidationError([_issue(
             file=modulo_central_path, sheet="STOCK-2405-1426", column="STOC_CANTIDAD", bad_rows=bad_rows,
             code="STOCK_NEGATIVE", message="STOC_CANTIDAD tiene valores negativos (prohibido).", type_="DATA_ERROR"
-        ))
-        raise HardValidationError(issues)
+        )])
 
     stock["STOC_CANTIDAD"] = qty.fillna(0)
 
@@ -134,12 +133,12 @@ def read_stock_and_mtd(modulo_central_path: str) -> Tuple[pd.DataFrame, pd.DataF
     try:
         mtd = pd.read_excel(modulo_central_path, sheet_name="REPORTE_DE_PEDIDOS-3978-1426", engine="openpyxl")
     except Exception as e:
-        issues.append(_issue(
+        raise HardValidationError([_issue(
             file=modulo_central_path, sheet="REPORTE_DE_PEDIDOS-3978-1426", column=None, bad_rows=[],
             code="MTD_SHEET_READ_FAIL", message=f"No se pudo leer hoja REPORTE_DE_PEDIDOS-3978-1426: {str(e)}", type_="TECH_ERROR"
-        ))
-        raise HardValidationError(issues)
+        )])
 
+    issues = []
     for col in ["FECHA_DESPACHO", "SKU", "CANTIDAD"]:
         if col not in mtd.columns:
             issues.append(_issue(
@@ -156,19 +155,17 @@ def read_stock_and_mtd(modulo_central_path: str) -> Tuple[pd.DataFrame, pd.DataF
     mask_bad_date = parsed.isna()
     bad_rows = _df_bad_rows(mtd, mask_bad_date)
     if bad_rows:
-        issues.append(_issue(
+        raise HardValidationError([_issue(
             file=modulo_central_path, sheet="REPORTE_DE_PEDIDOS-3978-1426", column="FECHA_DESPACHO", bad_rows=bad_rows,
             code="MTD_DATE_PARSE", message="FECHA_DESPACHO contiene fechas no parseables.", type_="DATA_ERROR"
-        ))
-        raise HardValidationError(issues)
+        )])
 
     mtd["FECHA_DESPACHO"] = parsed
     mtd["CANTIDAD"] = pd.to_numeric(mtd["CANTIDAD"], errors="coerce").fillna(0)
+    return stock, mtd
 
-    return stock, mtd, []
 
-
-def validate_mtd_month(mtd: pd.DataFrame, fecha_corte_efectiva: date, modulo_central_path: str) -> List[ValidationIssue]:
+def validate_mtd_month(mtd: pd.DataFrame, fecha_corte_efectiva: date, modulo_central_path: str) -> None:
     mes_corte = _month_start(fecha_corte_efectiva)
     mask_bad = mtd["FECHA_DESPACHO"].dt.to_period("M") != pd.Period(mes_corte, freq="M")
     bad_rows = _df_bad_rows(mtd, mask_bad)
@@ -179,10 +176,18 @@ def validate_mtd_month(mtd: pd.DataFrame, fecha_corte_efectiva: date, modulo_cen
             message=f"MTD contiene despachos fuera del mes de FECHA_CORTE_EFECTIVA ({mes_corte.isoformat()}).",
             type_="DATA_ERROR"
         )])
-    return []
 
 
-def read_and_validate_projection(proyeccion_path: str, fecha_corte_efectiva: date) -> Tuple[pd.DataFrame, Dict[Any, date], List[ValidationIssue]]:
+def read_and_validate_projection(
+    proyeccion_path: str,
+    fecha_corte_efectiva: date
+) -> Tuple[pd.DataFrame, Dict[Any, date], List[ValidationIssue]]:
+    """
+    Devuelve:
+      - df proyección validado
+      - month_map {col_header_original: date}
+      - notices (meses < MES_CORTE ignorados)
+    """
     try:
         df = pd.read_excel(proyeccion_path, sheet_name="GENERAL", engine="openpyxl")
     except Exception as e:
@@ -205,6 +210,7 @@ def read_and_validate_projection(proyeccion_path: str, fecha_corte_efectiva: dat
     df["SKU"] = df["SKU"].astype(str).str.strip()
     df["GRUPO"] = df["GRUPO"].astype(str).str.strip()
 
+    # SKU duplicado
     mask_dup = df["SKU"].duplicated(keep=False)
     bad_rows = _df_bad_rows(df, mask_dup)
     if bad_rows:
@@ -213,6 +219,7 @@ def read_and_validate_projection(proyeccion_path: str, fecha_corte_efectiva: dat
             code="PROJ_SKU_DUP", message="SKU duplicado en PROYECCION (prohibido).", type_="DATA_ERROR"
         )])
 
+    # Columnas de meses
     month_cols = [c for c in df.columns if c not in ["GRUPO", "SKU"]]
     if not month_cols:
         raise HardValidationError([_issue(
@@ -235,21 +242,52 @@ def read_and_validate_projection(proyeccion_path: str, fecha_corte_efectiva: dat
             )])
         parsed_months.append((c, d))
 
-    dates_only = [d for _, d in parsed_months]
-    if len(set(dates_only)) != len(dates_only):
-        raise HardValidationError([_issue(
-            file=proyeccion_path, sheet="GENERAL", column=None, bad_rows=[],
-            code="PROJ_MONTH_DUP", message="Existen meses duplicados en columnas de PROYECCION (misma fecha repetida).", type_="DATA_ERROR"
-        )])
+    # Duplicados por fecha -> evidencia por columna
+    date_to_cols: Dict[date, List[Any]] = {}
+    for c, d in parsed_months:
+        date_to_cols.setdefault(d, []).append(c)
+
+    dup_issues: List[ValidationIssue] = []
+    for d, cols in date_to_cols.items():
+        if len(cols) > 1:
+            cols_str = [str(x) for x in cols]
+            for col_header in cols:
+                dup_issues.append(_issue(
+                    file=proyeccion_path,
+                    sheet="GENERAL",
+                    column=str(col_header),
+                    bad_rows=[],
+                    code="PROJ_MONTH_DUP",
+                    message=f"Mes duplicado {d.isoformat()} en columnas: {cols_str}",
+                    type_="DATA_ERROR",
+                ))
+    if dup_issues:
+        raise HardValidationError(dup_issues)
 
     parsed_months.sort(key=lambda x: x[1])
 
+    # NOTICES: meses anteriores a MES_CORTE ignorados
     mes_corte = _month_start(fecha_corte_efectiva)
+    notices: List[ValidationIssue] = []
+    for col_header, d in parsed_months:
+        if d < mes_corte:
+            notices.append(_issue(
+                file=proyeccion_path,
+                sheet="GENERAL",
+                column=str(col_header),
+                bad_rows=[],
+                code="PROJ_MONTH_IGNORED",
+                message=f"Mes {d.isoformat()} anterior a MES_CORTE={mes_corte.isoformat()}; será ignorado.",
+                type_="DATA_ERROR",
+            ))
+
+    # Contigüidad desde MES_CORTE
     active_months = [d for _, d in parsed_months if d >= mes_corte]
     if not active_months:
         raise HardValidationError([_issue(
             file=proyeccion_path, sheet="GENERAL", column=None, bad_rows=[],
-            code="PROJ_NO_ACTIVE_MONTHS", message=f"No hay meses de proyección en/desde MES_CORTE={mes_corte.isoformat()}", type_="DATA_ERROR"
+            code="PROJ_NO_ACTIVE_MONTHS", message=f"No hay meses de proyección en/desde MES_CORTE={mes_corte.isoformat()}",
+            type_="DATA_ERROR"
         )])
 
     min_m, max_m = min(active_months), max(active_months)
@@ -270,6 +308,7 @@ def read_and_validate_projection(proyeccion_path: str, fecha_corte_efectiva: dat
             type_="DATA_ERROR"
         )])
 
+    # Demanda NULL/vacía -> error (0 válido)
     for c, _d in parsed_months:
         mask_null = df[c].isna()
         bad_rows = _df_bad_rows(df, mask_null)
@@ -279,6 +318,7 @@ def read_and_validate_projection(proyeccion_path: str, fecha_corte_efectiva: dat
                 code="PROJ_DEMAND_NULL", message="Demanda NULL/vacía detectada (prohibido).", type_="DATA_ERROR"
             )])
 
+    # Demanda numérica + redondeo v1.4
     for c, _d in parsed_months:
         try:
             df[c] = pd.to_numeric(df[c], errors="raise")
@@ -290,10 +330,10 @@ def read_and_validate_projection(proyeccion_path: str, fecha_corte_efectiva: dat
         df[c] = df[c].round().astype(int)
 
     month_map = {col: d for col, d in parsed_months}
-    return df, month_map, []
+    return df, month_map, notices
 
 
-def read_and_validate_transit(importaciones_path: str) -> Tuple[pd.DataFrame, List[ValidationIssue]]:
+def read_and_validate_transit(importaciones_path: str) -> pd.DataFrame:
     try:
         df = pd.read_excel(importaciones_path, sheet_name="IMPORTACIONES", engine="openpyxl")
     except Exception as e:
@@ -314,6 +354,7 @@ def read_and_validate_transit(importaciones_path: str) -> Tuple[pd.DataFrame, Li
 
     df = df.copy()
     df["SKU"] = df["SKU"].astype(str).str.strip()
+
     df = df.loc[df["ESTATUS"].astype(str).str.strip() == "Tránsito"].copy()
 
     parsed_eta = pd.to_datetime(df["ETA"], errors="coerce")
@@ -327,4 +368,4 @@ def read_and_validate_transit(importaciones_path: str) -> Tuple[pd.DataFrame, Li
 
     df["ETA"] = parsed_eta
     df["Cantidad"] = pd.to_numeric(df["Cantidad"], errors="coerce").fillna(0)
-    return df, []
+    return df
