@@ -2,7 +2,7 @@ import os
 import io
 import json
 import zipfile
-from datetime import datetime
+from datetime import datetime, date
 import hashlib
 import secrets
 import streamlit as st
@@ -85,7 +85,6 @@ def write_json(path: str, obj: dict):
 def make_zip_bytes(run_path: str) -> bytes:
     mem = io.BytesIO()
     with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        # incluir todo lo relevante del run
         for root, _, files in os.walk(run_path):
             for fn in files:
                 full = os.path.join(root, fn)
@@ -97,6 +96,27 @@ def make_zip_bytes(run_path: str) -> bytes:
 
 def issues_to_dict(issues: list[ValidationIssue]):
     return [{"level": i.level, "code": i.code, "message": i.message} for i in issues]
+
+
+def month_key(d: date) -> str:
+    # Clave canónica de mes para JSON: YYYY-MM
+    return f"{d.year:04d}-{d.month:02d}"
+
+
+def to_json_safe_month_map(month_map: dict) -> dict:
+    """
+    FIX técnico:
+    - month_map viene como {col_header: date} y col_header puede ser datetime/date (no serializable como key en JSON).
+    - Convertimos SIEMPRE la key a string (YYYY-MM) y metemos el header original como string dentro del value.
+    """
+    safe = {}
+    for col_header, d in month_map.items():
+        k = month_key(d)  # YYYY-MM (estándar, estable)
+        safe[k] = {
+            "date": d.isoformat(),          # YYYY-MM-DD
+            "source_col_header": str(col_header)  # auditabilidad sin romper JSON
+        }
+    return safe
 
 
 st.set_page_config(page_title="IA Operativa — Módulo 2 (FASE 2)", layout="wide")
@@ -145,7 +165,6 @@ if uploaded and len(uploaded) > 0:
         )
         fecha_override_iso = fecha_override.isoformat() if fecha_override else None
 
-    # Validar selección
     selected = [modulo_central_name, proyeccion_name, importaciones_name]
     if "(no seleccionado)" in selected:
         st.warning("Seleccioná los 3 archivos requeridos para habilitar RUN.")
@@ -164,12 +183,9 @@ if uploaded and len(uploaded) > 0:
         run_path = os.path.join(RUNS_DIR, run_id)
         os.makedirs(run_path, exist_ok=False)
 
-        # Guardar inputs crudos
         meta = save_uploaded_files(run_path, uploaded)
-
         run_log = build_run_log_base(run_id, created_at, meta, fecha_override_iso)
 
-        # Resolver paths reales
         name_to_path = {m["original_name"]: m["stored_path"] for m in meta}
         modulo_central_path = name_to_path[modulo_central_name]
         proyeccion_path = name_to_path[proyeccion_name]
@@ -179,26 +195,20 @@ if uploaded and len(uploaded) > 0:
         run_log["PARAMS_EFECTIVOS"]["PROYECCION_PATH"] = proyeccion_path
         run_log["PARAMS_EFECTIVOS"]["IMPORTACIONES_PATH"] = importaciones_path
 
-        # Ejecutar F2
         all_issues: list[ValidationIssue] = []
         try:
-            # Leer + validar stock y mtd
             stock_df, mtd_df, issues = read_stock_and_mtd(modulo_central_path)
             all_issues.extend(issues)
 
-            # Validación dura MTD por mes
             fecha_corte_efectiva = datetime.fromisoformat(run_log["FECHA_CORTE_EFECTIVA"]).date()
             all_issues.extend(validate_mtd_month(mtd_df, fecha_corte_efectiva))
 
-            # Proyección
             proj_df, month_map, proj_issues = read_and_validate_projection(proyeccion_path, fecha_corte_efectiva)
             all_issues.extend(proj_issues)
 
-            # Importaciones tránsito
             transit_df, impo_issues = read_and_validate_transit(importaciones_path)
             all_issues.extend(impo_issues)
 
-            # Conteos (auditables)
             run_log["COUNTS"] = {
                 "STOCK_ROWS": int(len(stock_df)),
                 "MTD_ROWS": int(len(mtd_df)),
@@ -207,11 +217,11 @@ if uploaded and len(uploaded) > 0:
                 "PROJ_MONTH_COLS": int(len(month_map)),
             }
 
-            # Persistir un reporte de validación (permitido en F2)
+            # FIX: month_map puede tener keys datetime -> convertir a string antes de serializar
             validation_report = {
                 "FECHA_CORTE_EFECTIVA": run_log["FECHA_CORTE_EFECTIVA"],
                 "VALIDATIONS": issues_to_dict(all_issues),
-                "MONTH_COLUMNS_MAP": {k: v.isoformat() for k, v in month_map.items()},
+                "MONTH_COLUMNS_MAP": to_json_safe_month_map(month_map),
             }
             write_json(os.path.join(run_path, "validation_report.json"), validation_report)
 
@@ -236,7 +246,6 @@ if uploaded and len(uploaded) > 0:
                 "ERRORS": run_log["ERRORS"],
             })
 
-        # Guardar run_log
         write_json(os.path.join(run_path, "run_log.json"), run_log)
 
         st.success(f"RUN generado: {run_id} — STATUS={run_log['STATUS']}")
