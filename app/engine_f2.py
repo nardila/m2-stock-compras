@@ -302,7 +302,7 @@ def read_and_validate_projection(
     if set(expected) != set(active_months):
         missing_months = sorted(set(expected) - set(active_months))
         raise HardValidationError([_issue(
-            file=proyeccion_path, sheet="GENERAL", column=None, bad_rows=[],
+            file=proyeccion_path, sheet="GENERAL", column="(STRUCTURE)", bad_rows=[],
             code="PROJ_MONTH_GAP",
             message=f"Falta(n) mes(es) intermedio(s) en proyección: {[d.isoformat() for d in missing_months]}",
             type_="DATA_ERROR"
