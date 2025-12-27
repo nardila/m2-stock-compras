@@ -1,17 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from math import ceil
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import pandas as pd
 
-# Reutilizamos el contrato de F2 (para mantener consistencia)
-# En F3.1 no vamos a tirar HardValidationError por reglas de negocio nuevas;
-# Si faltan inputs canónicos, eso ya lo frena F2.
 from engine_f2 import ValidationIssue, _issue
-
 
 LEAD_TIME_DEFAULT_DAYS = 120  # v1.4 (calendario)
 BUFFER_ETA_DIAS_DEFAULT = 7   # v1.4
@@ -23,7 +18,6 @@ def _month_start(d: date) -> date:
 
 
 def _month_end(d: date) -> date:
-    # último día del mes
     if d.month == 12:
         nxt = date(d.year + 1, 1, 1)
     else:
@@ -32,7 +26,6 @@ def _month_end(d: date) -> date:
 
 
 def _daterange(d0: date, d1: date) -> List[date]:
-    # inclusive
     days = (d1 - d0).days
     return [d0 + timedelta(days=i) for i in range(days + 1)]
 
@@ -41,56 +34,11 @@ def _safe_strip_series(s: pd.Series) -> pd.Series:
     return s.astype(str).str.strip()
 
 
-def _parse_lead_time_override_table(
-    proyeccion_path: str,
-) -> Dict[str, int]:
-    """
-    v1.4: "Tabla opcional: SKU -> LEAD_TIME"
-    Como la especificación no fija sheet/column names en el extracto que vimos,
-    implementamos detección no-invasiva:
-      - si existe una hoja llamada 'LEAD_TIME' o 'PARAMETROS' o 'PARAMS'
-      - y tiene columnas SKU y LEAD_TIME (case-insensitive)
-    Si no existe o no matchea, devuelve {} sin error.
-    """
-    candidates = ["LEAD_TIME", "PARAMETROS", "PARAMS", "PARÁMETROS"]
-    override: Dict[str, int] = {}
-
-    try:
-        xls = pd.ExcelFile(proyeccion_path, engine="openpyxl")
-    except Exception:
-        return override
-
-    sheet = None
-    for s in candidates:
-        if s in xls.sheet_names:
-            sheet = s
-            break
-    if sheet is None:
-        return override
-
-    try:
-        df = pd.read_excel(proyeccion_path, sheet_name=sheet, engine="openpyxl")
-    except Exception:
-        return override
-
-    cols = {c.lower().strip(): c for c in df.columns}
-    if "sku" not in cols or "lead_time" not in cols:
-        return override
-
-    sku_col = cols["sku"]
-    lt_col = cols["lead_time"]
-
-    tmp = df[[sku_col, lt_col]].copy()
-    tmp[sku_col] = _safe_strip_series(tmp[sku_col])
-    tmp[lt_col] = pd.to_numeric(tmp[lt_col], errors="coerce")
-
-    tmp = tmp.dropna(subset=[sku_col, lt_col])
-    tmp = tmp[tmp[lt_col] >= 0]
-
-    for _, r in tmp.iterrows():
-        override[str(r[sku_col]).strip()] = int(r[lt_col])
-
-    return override
+def _pick_col(df: pd.DataFrame, candidates: List[str]) -> str:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    raise KeyError(f"No se encontró ninguna de estas columnas: {candidates}. Disponibles: {list(df.columns)}")
 
 
 def _build_daily_demand_decimal(
@@ -100,30 +48,20 @@ def _build_daily_demand_decimal(
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
     """
     v1.4:
-      - Demanda mes en curso ajustada:
-          DEMANDA_RESTANTE = max(0, PROYECTADO_MES - VENTAS_MTD)
-      - DEMANDA_DIARIA en decimal
-      - Simulación diaria usa decimales
-      - No se redondea nada intermedio
-
-    Construye una tabla: [date, SKU, demand] (float).
-    Retorna además un dict de totales (auditoría) por SKU.
+      - Mes corte: demanda restante = max(0, PROY - MTD)
+      - Distribución diaria en decimal (sin redondeo intermedio)
+      - No arrastre de demanda
     """
-    # Identificar columnas de meses (date objects) en proj_df:
-    month_cols: List[Tuple[str, date]] = []
+    month_cols: List[Tuple[object, date]] = []
     for c in proj_df.columns:
         if c in ("GRUPO", "SKU"):
             continue
-        # en F2 ya validamos que son parseables y 1er día del mes,
-        # pero acá recibimos el DF ya limpio; asumimos que c es el header original.
-        # Para seguridad intentamos parsear.
         try:
             d = pd.to_datetime(str(c)).date()
+            month_cols.append((c, date(d.year, d.month, 1)))
         except Exception:
             continue
-        month_cols.append((c, date(d.year, d.month, 1)))
 
-    # fallback si los headers vienen como datetime directamente:
     if not month_cols:
         for c in proj_df.columns:
             if c in ("GRUPO", "SKU"):
@@ -138,10 +76,8 @@ def _build_daily_demand_decimal(
     month_cols.sort(key=lambda x: x[1])
 
     mes_corte = _month_start(fecha_corte)
-    # Filtrar meses >= MES_CORTE
     month_cols = [(col, d) for col, d in month_cols if d >= mes_corte]
 
-    # MTD agregado por SKU
     mtd = mtd_df.copy()
     mtd["SKU"] = _safe_strip_series(mtd["SKU"])
     mtd["CANTIDAD"] = pd.to_numeric(mtd["CANTIDAD"], errors="coerce").fillna(0.0)
@@ -150,34 +86,28 @@ def _build_daily_demand_decimal(
     rows = []
     totals_by_sku: Dict[str, float] = {}
 
-    # Para cada SKU en proyección
     for _, r in proj_df.iterrows():
         sku = str(r["SKU"]).strip()
 
         for col, m0 in month_cols:
-            m_start = m0
             m_end = _month_end(m0)
-
             projected_month = float(r[col])
 
-            # Ajuste solo para mes de corte
             if m0 == mes_corte:
                 ventas_mtd = float(mtd_by_sku.get(sku, 0.0))
                 demanda_mes = max(0.0, projected_month - ventas_mtd)
-
-                # Se distribuye SOLO en los días restantes desde FECHA_CORTE (inclusive)
                 d0 = fecha_corte
                 d1 = m_end
             else:
                 demanda_mes = projected_month
-                d0 = m_start
+                d0 = m0
                 d1 = m_end
 
             days = (d1 - d0).days + 1
             if days <= 0:
                 continue
 
-            demand_daily = demanda_mes / float(days)  # decimal
+            demand_daily = demanda_mes / float(days)
 
             for d in _daterange(d0, d1):
                 rows.append({"date": d, "SKU": sku, "demand": demand_daily})
@@ -199,11 +129,7 @@ def _build_inbound_schedule(
     horizon_end: date,
     buffer_eta_days: int = BUFFER_ETA_DIAS_DEFAULT,
 ) -> pd.DataFrame:
-    """
-    v1.4:
-      FECHA_INGRESO = ETA + BUFFER_ETA_DIAS
-    Solo ESTATUS='Tránsito' ya viene filtrado desde F2.
-    """
+    """v1.4: FECHA_INGRESO = ETA + BUFFER_ETA_DIAS"""
     if transit_df is None or len(transit_df) == 0:
         return pd.DataFrame(columns=["date", "SKU", "qty"])
 
@@ -216,7 +142,6 @@ def _build_inbound_schedule(
     t["date"] = t["ETA"] + pd.to_timedelta(buffer_eta_days, unit="D")
     t["date"] = t["date"].dt.normalize()
 
-    # recortar horizonte
     d0 = pd.to_datetime(fecha_corte)
     d1 = pd.to_datetime(horizon_end)
     t = t[(t["date"] >= d0) & (t["date"] <= d1)].copy()
@@ -241,23 +166,14 @@ def simulate_f3_1_baseline(
     fecha_corte: date,
 ) -> Tuple[pd.DataFrame, dict, List[ValidationIssue]]:
     """
-    FASE 3.1:
-      - Simulación diaria con decimales
-      - Sin compras
-      - Stock cap a 0
-      - Ventas no cubiertas = perdidas
-      - No arrastre de demanda
-      - DEMANDA mes de corte ajustada por MTD (max(0, proj - mtd))
-
-    Outputs:
-      - simulation_df (por día y SKU)
-      - kpis dict
-      - notices (trazables)
+    F3.1: simulación diaria baseline (sin compras)
+      - decimales
+      - cap stock en 0
+      - ventas perdidas
+      - sin arrastre de demanda
     """
     notices: List[ValidationIssue] = []
 
-    # Horizonte = último mes presente en proyección (>= MES_CORTE)
-    # Buscamos el último header de mes
     month_dates = []
     for c in proj_df.columns:
         if c in ("GRUPO", "SKU"):
@@ -272,7 +188,6 @@ def simulate_f3_1_baseline(
 
     month_dates = sorted(set([d for d in month_dates if d >= _month_start(fecha_corte)]))
     if not month_dates:
-        # No debería ocurrir si F2 pasó, pero si pasa: notice técnico
         notices.append(_issue(
             file=proyeccion_path, sheet="GENERAL", column="(STRUCTURE)", bad_rows=[],
             code="F3_NO_ACTIVE_MONTHS",
@@ -283,8 +198,7 @@ def simulate_f3_1_baseline(
 
     horizon_end = _month_end(month_dates[-1])
 
-    # Demanda diaria decimal
-    daily_demand_df, _totals = _build_daily_demand_decimal(proj_df, mtd_df, fecha_corte)
+    daily_demand_df, _ = _build_daily_demand_decimal(proj_df, mtd_df, fecha_corte)
     if daily_demand_df.empty:
         notices.append(_issue(
             file=proyeccion_path, sheet="GENERAL", column="(STRUCTURE)", bad_rows=[],
@@ -294,32 +208,30 @@ def simulate_f3_1_baseline(
         ))
         return pd.DataFrame(), {"status": "NO_DATA"}, notices
 
-    # Inbound por tránsito (ETA + buffer)
     inbound_df = _build_inbound_schedule(transit_df, fecha_corte, horizon_end, BUFFER_ETA_DIAS_DEFAULT)
 
-    # SKUs a simular = SKUs de proyección
     proj_skus = set(_safe_strip_series(proj_df["SKU"]).tolist())
 
-    # Stock inicial por SKU (si falta, asumir 0 y notice)
+    # Tolerar ambos esquemas de stock_df (STOC_* o SKU/STOCK)
     st = stock_df.copy()
-    st["STOC_SKU"] = _safe_strip_series(st["STOC_SKU"])
-    st["STOC_CANTIDAD"] = pd.to_numeric(st["STOC_CANTIDAD"], errors="coerce").fillna(0.0)
-    stock_map = st.groupby("STOC_SKU", as_index=True)["STOC_CANTIDAD"].sum().to_dict()
+    sku_col = _pick_col(st, ["STOC_SKU", "SKU"])
+    qty_col = _pick_col(st, ["STOC_CANTIDAD", "STOCK", "CANTIDAD"])
+
+    st[sku_col] = _safe_strip_series(st[sku_col])
+    st[qty_col] = pd.to_numeric(st[qty_col], errors="coerce").fillna(0.0)
+    stock_map = st.groupby(sku_col, as_index=True)[qty_col].sum().to_dict()
 
     missing_stock = sorted(proj_skus - set(stock_map.keys()))
     for sku in missing_stock:
         notices.append(_issue(
-            file=modulo_central_path, sheet="STOCK-2405-1426", column="STOC_SKU", bad_rows=[],
+            file=modulo_central_path, sheet="STOCK-2405-1426", column=sku_col, bad_rows=[],
             code="STOCK_SKU_MISSING_ASSUME_0",
             message=f"F3.1: SKU {sku} no tiene stock informado; se asume 0.",
             type_="DATA_ERROR"
         ))
 
-    # Armamos grillas por día x SKU solo para los SKUs en proyección
-    # demand ya es (date, SKU)
     dd = daily_demand_df[daily_demand_df["SKU"].isin(proj_skus)].copy()
 
-    # Asegurar rango completo de fechas para todos los SKUs (si algún SKU no tiene demanda en algún día, demanda=0)
     all_days = pd.date_range(pd.to_datetime(fecha_corte), pd.to_datetime(horizon_end), freq="D")
     base = pd.MultiIndex.from_product([all_days, sorted(proj_skus)], names=["date", "SKU"]).to_frame(index=False)
 
@@ -327,7 +239,6 @@ def simulate_f3_1_baseline(
     sim = base.merge(dd, on=["date", "SKU"], how="left")
     sim["demand"] = sim["demand"].fillna(0.0)
 
-    # Inbound merge
     if inbound_df is None or inbound_df.empty:
         sim["inbound"] = 0.0
     else:
@@ -339,17 +250,11 @@ def simulate_f3_1_baseline(
         sim = sim.merge(inbound_df2.rename(columns={"qty": "inbound"}), on=["date", "SKU"], how="left")
         sim["inbound"] = sim["inbound"].fillna(0.0)
 
-    # Simulación secuencial por SKU
     out_rows = []
 
     for sku in sorted(proj_skus):
         sku_sim = sim[sim["SKU"] == sku].sort_values("date").copy()
-
         on_hand = float(stock_map.get(sku, 0.0))
-        total_demand = 0.0
-        total_fulfilled = 0.0
-        total_lost = 0.0
-        stockout_days = 0
 
         for _, r in sku_sim.iterrows():
             d = r["date"]
@@ -357,21 +262,14 @@ def simulate_f3_1_baseline(
             inbound = float(r["inbound"])
 
             on_hand_start = on_hand
-            on_hand_mid = on_hand_start + inbound
+            on_hand_mid = on_hand_start + inbound  # stock al inicio del día, post inbound
 
             fulfilled = min(demand, on_hand_mid)
             lost = max(0.0, demand - fulfilled)
 
             on_hand_end = on_hand_mid - fulfilled
             if on_hand_end < 0:
-                on_hand_end = 0.0  # cap en cero (v1.4)
-
-            if on_hand_mid <= 0 and demand > 0:
-                stockout_days += 1
-
-            total_demand += demand
-            total_fulfilled += fulfilled
-            total_lost += lost
+                on_hand_end = 0.0  # cap en cero
 
             out_rows.append({
                 "date": d.date().isoformat(),
@@ -386,12 +284,8 @@ def simulate_f3_1_baseline(
 
             on_hand = on_hand_end
 
-        # KPI por SKU (se calcula luego global)
-        # (si querés top20, lo armamos en streamlit_app.py)
-
     out = pd.DataFrame(out_rows)
 
-    # KPIs globales
     total_demand = float(out["demand"].sum()) if len(out) else 0.0
     total_fulfilled = float(out["fulfilled"].sum()) if len(out) else 0.0
     total_lost = float(out["lost_sales"].sum()) if len(out) else 0.0
@@ -411,3 +305,107 @@ def simulate_f3_1_baseline(
     }
 
     return out, kpis, notices
+
+
+def plan_purchase_f3_2_default120(
+    *,
+    simulation_df: pd.DataFrame,
+    fecha_corte: date,
+    proyeccion_path: str,
+) -> Tuple[pd.DataFrame, dict, List[ValidationIssue]]:
+    """
+    F3.2 (v1.4, sin overrides):
+      - Una emisión planificada en FECHA_CORTE
+      - Llega en FECHA_CORTE + 120 días
+      - Al ingreso (inicio del día post inbound existente), el stock disponible debe cubrir 30 días corridos de demanda futura
+      - qty = ceil(max(0, demanda_30d - stock_al_ingreso))
+    """
+    notices: List[ValidationIssue] = []
+
+    if simulation_df is None or len(simulation_df) == 0:
+        notices.append(_issue(
+            file=proyeccion_path, sheet="GENERAL", column="(STRUCTURE)", bad_rows=[],
+            code="F3_2_NO_SIMULATION",
+            message="F3.2: simulation_df vacío; no se puede calcular plan de compra.",
+            type_="TECH_ERROR"
+        ))
+        return pd.DataFrame(), {"status": "NO_DATA"}, notices
+
+    sim = simulation_df.copy()
+    sim["date"] = pd.to_datetime(sim["date"])
+    sim["SKU"] = _safe_strip_series(sim["SKU"])
+    for c in ["on_hand_start", "inbound", "demand"]:
+        sim[c] = pd.to_numeric(sim[c], errors="coerce").fillna(0.0)
+
+    emission_date = pd.to_datetime(fecha_corte)
+    arrival_date = emission_date + pd.to_timedelta(LEAD_TIME_DEFAULT_DAYS, unit="D")
+    arrival_end = arrival_date + pd.to_timedelta(COVERAGE_DAYS - 1, unit="D")
+
+    # Chequeo de horizonte (notice, no error duro)
+    min_d = sim["date"].min()
+    max_d = sim["date"].max()
+    if arrival_date < min_d or arrival_end > max_d:
+        notices.append(_issue(
+            file=proyeccion_path, sheet="GENERAL", column="(STRUCTURE)", bad_rows=[],
+            code="F3_2_WINDOW_OUT_OF_HORIZON",
+            message=(
+                f"F3.2: ventana de cobertura [{arrival_date.date().isoformat()}..{arrival_end.date().isoformat()}] "
+                f"fuera del horizonte de simulación [{min_d.date().isoformat()}..{max_d.date().isoformat()}]."
+            ),
+            type_="DATA_ERROR"
+        ))
+        # igual devolvemos vacío para no inventar compras
+        return pd.DataFrame(), {
+            "status": "WINDOW_OUT_OF_HORIZON",
+            "EMISSION_DATE": emission_date.date().isoformat(),
+            "ARRIVAL_DATE": arrival_date.date().isoformat(),
+            "COVERAGE_DAYS": COVERAGE_DAYS,
+        }, notices
+
+    # stock al ingreso = on_hand_start + inbound en arrival_date
+    sim_arrival = sim[sim["date"] == arrival_date].copy()
+    sim_arrival["stock_al_ingreso"] = sim_arrival["on_hand_start"] + sim_arrival["inbound"]
+
+    stock_ingreso_map = sim_arrival.set_index("SKU")["stock_al_ingreso"].to_dict()
+
+    # demanda 30d = suma demand en [arrival_date, arrival_end]
+    window = sim[(sim["date"] >= arrival_date) & (sim["date"] <= arrival_end)].copy()
+    demand_30d_map = window.groupby("SKU", as_index=True)["demand"].sum().to_dict()
+
+    skus = sorted(set(sim["SKU"].unique().tolist()))
+    rows = []
+    for sku in skus:
+        stock_ing = float(stock_ingreso_map.get(sku, 0.0))
+        dem_30 = float(demand_30d_map.get(sku, 0.0))
+        faltante = max(0.0, dem_30 - stock_ing)
+        qty = int(ceil(faltante))
+
+        rows.append({
+            "SKU": sku,
+            "FECHA_EMISION_PLANIFICADA": emission_date.date().isoformat(),
+            "FECHA_LLEGADA": arrival_date.date().isoformat(),
+            "LEAD_TIME_DIAS": LEAD_TIME_DEFAULT_DAYS,
+            "COBERTURA_DIAS": COVERAGE_DAYS,
+            "STOCK_AL_INGRESO": stock_ing,
+            "DEMANDA_30D_POST_LLEGADA": dem_30,
+            "FALTANTE": faltante,
+            "QTY_A_COMPRAR": qty,
+        })
+
+    plan = pd.DataFrame(rows)
+
+    # KPIs del plan
+    total_qty = int(plan["QTY_A_COMPRAR"].sum()) if len(plan) else 0
+    skus_compra = int((plan["QTY_A_COMPRAR"] > 0).sum()) if len(plan) else 0
+
+    kpis = {
+        "F3_STAGE": "F3_2_PURCHASE_PLAN",
+        "EMISSION_DATE": emission_date.date().isoformat(),
+        "ARRIVAL_DATE": arrival_date.date().isoformat(),
+        "COVERAGE_DAYS": COVERAGE_DAYS,
+        "LEAD_TIME_DEFAULT_DAYS": LEAD_TIME_DEFAULT_DAYS,
+        "TOTAL_QTY_TO_BUY": total_qty,
+        "SKUS_WITH_BUY_QTY": skus_compra,
+    }
+
+    return plan, kpis, notices
