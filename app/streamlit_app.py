@@ -8,6 +8,8 @@ import secrets
 import streamlit as st
 import pandas as pd
 
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+
 from engine_f2 import (
     HardValidationError,
     ValidationIssue,
@@ -68,8 +70,69 @@ def write_json(path: str, obj: dict):
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 
-def write_csv(path: str, df: pd.DataFrame):
-    df.to_csv(path, index=False, encoding="utf-8")
+# -----------------------------
+# CSV Output Contract (F3.x)
+# - max 2 decimales
+# - redondeo estándar (half-up)
+# - sin notación científica
+# - UTF-8
+# - decimal '.'
+# - NO redondear cálculos internos: solo copia exportada
+# -----------------------------
+
+def _round_half_up_2dp(x):
+    if x is None:
+        return x
+    try:
+        if pd.isna(x):
+            return x
+    except Exception:
+        pass
+
+    # Convertimos vía str para evitar artefactos binarios
+    try:
+        d = Decimal(str(x))
+        return float(d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError, TypeError):
+        return x
+
+
+def _prepare_f3_csv_export(df: pd.DataFrame) -> pd.DataFrame:
+    export_df = df.copy(deep=True)
+
+    # Identificar columnas numéricas
+    num_cols = export_df.select_dtypes(include=["number"]).columns.tolist()
+    if not num_cols:
+        return export_df
+
+    # Redondeo half-up SOLO en la copia de export
+    export_df[num_cols] = export_df[num_cols].applymap(_round_half_up_2dp)
+
+    # Homogeneidad 2 decimales: convertimos a float (solo export)
+    # Nota: esto NO toca el df original.
+    for c in num_cols:
+        export_df[c] = pd.to_numeric(export_df[c], errors="coerce")
+
+    return export_df
+
+
+def write_csv_f3(path: str, df: pd.DataFrame):
+    """
+    Export F3.x:
+      - UTF-8
+      - '.' decimal
+      - sin notación científica (float_format)
+      - 2 decimales homogéneos (float_format + redondeo half-up previo)
+    """
+    export_df = _prepare_f3_csv_export(df)
+
+    export_df.to_csv(
+        path,
+        index=False,
+        encoding="utf-8",
+        float_format="%.2f",   # evita notación científica y fuerza 2 decimales
+        lineterminator="\n"
+    )
 
 
 def make_zip_bytes(run_path: str) -> bytes:
@@ -120,7 +183,7 @@ def build_run_log_base(run_id: str, created_at: datetime, input_files_meta, fech
         "FECHA_CORTE_EFECTIVA": fecha_corte_efectiva,
         "OVERRIDE_ACTIVO": bool(fecha_corte_override_iso),
 
-        # Requisito anexo: trazabilidad obligatoria del escenario por RUN
+        # Parametrización por RUN (escenario)
         "PARAMETROS_RUN": {
             "FECHA_CORTE_OVERRIDE": fecha_corte_override_iso,
             "LEAD_TIME_DIAS": int(lead_time_days),
@@ -132,7 +195,7 @@ def build_run_log_base(run_id: str, created_at: datetime, input_files_meta, fech
         "VALIDATIONS": [],
         "PARAMS_EFECTIVOS": {},
         "COUNTS": {},
-        "NOTES": "F2: validaciones duras. F3.1: simulación baseline. F3.2: plan compra parametrizable por RUN.",
+        "NOTES": "F2: validaciones duras. F3: escenarios por RUN (LT/cobertura) + outputs CSV con 2 decimales.",
         "F3": {
             "STATUS": None,
             "KPIS_F3_1": {},
@@ -158,7 +221,7 @@ st.set_page_config(page_title="IA Operativa — Módulo 2 (FASE 2/3)", layout="w
 ensure_dirs()
 
 st.title("IA Operativa — Módulo 2: Stock y Compras (FASE 2/3)")
-st.caption("F2: validaciones duras. F3: escenarios por RUN (LT y cobertura) + trazabilidad en run_log.json.")
+st.caption("F2: validaciones duras. F3: escenarios por RUN (LT/cobertura) + outputs CSV estables (2 decimales).")
 
 uploaded = st.file_uploader("Subí los archivos (xlsx)", accept_multiple_files=True, type=["xlsx"])
 
@@ -175,7 +238,6 @@ if uploaded:
         fecha_override = st.date_input("FECHA_CORTE_OVERRIDE (opcional)", value=None)
         fecha_override_iso = fecha_override.isoformat() if fecha_override else None
 
-    # Parámetros de escenario (visibles antes de RUN)
     st.markdown("### Escenario (por RUN)")
     c1, c2 = st.columns(2)
     with c1:
@@ -195,7 +257,6 @@ if uploaded:
             step=1,
         )
 
-    # Resumen visible del escenario efectivo
     fecha_corte_preview = fecha_override_iso or date.today().isoformat()
     st.info(
         f"Escenario efectivo → FECHA_CORTE: {fecha_corte_preview} | "
@@ -205,7 +266,6 @@ if uploaded:
     selected = [modulo_central_name, proyeccion_name, importaciones_name]
     can_run_files = "(no seleccionado)" not in selected and len(set(selected)) == 3
 
-    # Bloqueo ante inválidos (anexo)
     valid_params = (lead_time_days is not None and cobertura_days is not None
                     and int(lead_time_days) >= 0 and int(cobertura_days) >= 1)
 
@@ -266,7 +326,7 @@ if uploaded:
             lt = int(run_log["PARAMETROS_RUN"]["LEAD_TIME_DIAS"])
             cov = int(run_log["PARAMETROS_RUN"]["COBERTURA_DIAS"])
 
-            # ===== FASE 2 (siempre) =====
+            # ===== FASE 2 =====
             stock_df, mtd_df = read_stock_and_mtd(modulo_central_path)
             validate_mtd_month(mtd_df, fecha_corte_efectiva, modulo_central_path)
             proj_df, month_map, proj_notices = read_and_validate_projection(proyeccion_path, fecha_corte_efectiva)
@@ -300,8 +360,11 @@ if uploaded:
                     cobertura_days=cov,
                 )
                 validation_report["NOTICES"].extend(issues_to_dict(f3_notices_1))
+
                 if sim_df is not None and len(sim_df) > 0:
-                    write_csv(os.path.join(outputs_dir, "simulation_daily.csv"), sim_df)
+                    # ✅ Contrato F3: 2 decimales / no sci / UTF-8
+                    write_csv_f3(os.path.join(outputs_dir, "simulation_daily.csv"), sim_df)
+
                 write_json(os.path.join(outputs_dir, "kpis_f3_1.json"), kpis_1)
                 run_log["F3"]["KPIS_F3_1"] = kpis_1
                 run_log["F3"]["STATUS"] = "OK_F3_1"
@@ -316,8 +379,11 @@ if uploaded:
                     cobertura_days=cov,
                 )
                 validation_report["NOTICES"].extend(issues_to_dict(f3_notices_2))
+
                 if plan_df is not None and len(plan_df) > 0:
-                    write_csv(os.path.join(outputs_dir, "purchase_plan.csv"), plan_df)
+                    # ✅ Contrato F3: 2 decimales / no sci / UTF-8
+                    write_csv_f3(os.path.join(outputs_dir, "purchase_plan.csv"), plan_df)
+
                 write_json(os.path.join(outputs_dir, "kpis_f3_2.json"), kpis_2)
                 run_log["F3"]["KPIS_F3_2"] = kpis_2
                 run_log["F3"]["STATUS"] = "OK_F3_2"
