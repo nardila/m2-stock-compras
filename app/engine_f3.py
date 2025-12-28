@@ -8,9 +8,12 @@ import pandas as pd
 
 from engine_f2 import ValidationIssue, _issue
 
-LEAD_TIME_DEFAULT_DAYS = 120  # v1.4 (calendario)
-BUFFER_ETA_DIAS_DEFAULT = 7   # v1.4
-COVERAGE_DAYS = 30            # v1.4 (no configurable)
+# v1.4 defaults (ahora pasan a ser defaults de UI, pero se permiten overrides por RUN)
+LEAD_TIME_DEFAULT_DAYS = 120
+COVERAGE_DEFAULT_DAYS = 30
+
+# v1.4 fijo (no solicitado parametrizar)
+BUFFER_ETA_DIAS_DEFAULT = 7
 
 
 def _month_start(d: date) -> date:
@@ -164,6 +167,8 @@ def simulate_f3_1_baseline(
     modulo_central_path: str,
     importaciones_path: str,
     fecha_corte: date,
+    lead_time_days: int = LEAD_TIME_DEFAULT_DAYS,
+    cobertura_days: int = COVERAGE_DEFAULT_DAYS,
 ) -> Tuple[pd.DataFrame, dict, List[ValidationIssue]]:
     """
     F3.1: simulación diaria baseline (sin compras)
@@ -171,6 +176,9 @@ def simulate_f3_1_baseline(
       - cap stock en 0
       - ventas perdidas
       - sin arrastre de demanda
+
+    Nota: lead_time_days y cobertura_days NO cambian F3.1 (no hay compras),
+    pero se loguean en KPIs para trazabilidad del escenario.
     """
     notices: List[ValidationIssue] = []
 
@@ -296,8 +304,8 @@ def simulate_f3_1_baseline(
         "FECHA_CORTE_EFECTIVA": fecha_corte.isoformat(),
         "HORIZON_END": horizon_end.isoformat(),
         "BUFFER_ETA_DIAS": BUFFER_ETA_DIAS_DEFAULT,
-        "LEAD_TIME_DEFAULT_DAYS": LEAD_TIME_DEFAULT_DAYS,
-        "COVERAGE_DAYS": COVERAGE_DAYS,
+        "LEAD_TIME_DIAS": int(lead_time_days),
+        "COBERTURA_DIAS": int(cobertura_days),
         "TOTAL_DEMAND": total_demand,
         "TOTAL_FULFILLED": total_fulfilled,
         "TOTAL_LOST_SALES": total_lost,
@@ -307,18 +315,22 @@ def simulate_f3_1_baseline(
     return out, kpis, notices
 
 
-def plan_purchase_f3_2_default120(
+def plan_purchase_f3_2_scenario(
     *,
     simulation_df: pd.DataFrame,
     fecha_corte: date,
     proyeccion_path: str,
+    lead_time_days: int,
+    cobertura_days: int,
 ) -> Tuple[pd.DataFrame, dict, List[ValidationIssue]]:
     """
-    F3.2 (v1.4, sin overrides):
+    F3.2 (v1.4 + anexo operativo):
       - Una emisión planificada en FECHA_CORTE
-      - Llega en FECHA_CORTE + 120 días
-      - Al ingreso (inicio del día post inbound existente), el stock disponible debe cubrir 30 días corridos de demanda futura
-      - qty = ceil(max(0, demanda_30d - stock_al_ingreso))
+      - Llega en FECHA_CORTE + LEAD_TIME_DIAS (escenario)
+      - Al ingreso (inicio del día post inbound existente), stock debe cubrir COBERTURA_DIAS post-llegada
+      - qty = ceil(max(0, demanda_cobertura - stock_al_ingreso))
+
+    No cambia algoritmo, solo parametriza el horizonte temporal.
     """
     notices: List[ValidationIssue] = []
 
@@ -338,10 +350,9 @@ def plan_purchase_f3_2_default120(
         sim[c] = pd.to_numeric(sim[c], errors="coerce").fillna(0.0)
 
     emission_date = pd.to_datetime(fecha_corte)
-    arrival_date = emission_date + pd.to_timedelta(LEAD_TIME_DEFAULT_DAYS, unit="D")
-    arrival_end = arrival_date + pd.to_timedelta(COVERAGE_DAYS - 1, unit="D")
+    arrival_date = emission_date + pd.to_timedelta(int(lead_time_days), unit="D")
+    arrival_end = arrival_date + pd.to_timedelta(int(cobertura_days) - 1, unit="D")
 
-    # Chequeo de horizonte (notice, no error duro)
     min_d = sim["date"].min()
     max_d = sim["date"].max()
     if arrival_date < min_d or arrival_end > max_d:
@@ -354,47 +365,43 @@ def plan_purchase_f3_2_default120(
             ),
             type_="DATA_ERROR"
         ))
-        # igual devolvemos vacío para no inventar compras
         return pd.DataFrame(), {
             "status": "WINDOW_OUT_OF_HORIZON",
             "EMISSION_DATE": emission_date.date().isoformat(),
             "ARRIVAL_DATE": arrival_date.date().isoformat(),
-            "COVERAGE_DAYS": COVERAGE_DAYS,
+            "COBERTURA_DIAS": int(cobertura_days),
+            "LEAD_TIME_DIAS": int(lead_time_days),
         }, notices
 
-    # stock al ingreso = on_hand_start + inbound en arrival_date
     sim_arrival = sim[sim["date"] == arrival_date].copy()
     sim_arrival["stock_al_ingreso"] = sim_arrival["on_hand_start"] + sim_arrival["inbound"]
-
     stock_ingreso_map = sim_arrival.set_index("SKU")["stock_al_ingreso"].to_dict()
 
-    # demanda 30d = suma demand en [arrival_date, arrival_end]
     window = sim[(sim["date"] >= arrival_date) & (sim["date"] <= arrival_end)].copy()
-    demand_30d_map = window.groupby("SKU", as_index=True)["demand"].sum().to_dict()
+    demand_cov_map = window.groupby("SKU", as_index=True)["demand"].sum().to_dict()
 
     skus = sorted(set(sim["SKU"].unique().tolist()))
     rows = []
     for sku in skus:
         stock_ing = float(stock_ingreso_map.get(sku, 0.0))
-        dem_30 = float(demand_30d_map.get(sku, 0.0))
-        faltante = max(0.0, dem_30 - stock_ing)
+        dem_cov = float(demand_cov_map.get(sku, 0.0))
+        faltante = max(0.0, dem_cov - stock_ing)
         qty = int(ceil(faltante))
 
         rows.append({
             "SKU": sku,
             "FECHA_EMISION_PLANIFICADA": emission_date.date().isoformat(),
             "FECHA_LLEGADA": arrival_date.date().isoformat(),
-            "LEAD_TIME_DIAS": LEAD_TIME_DEFAULT_DAYS,
-            "COBERTURA_DIAS": COVERAGE_DAYS,
+            "LEAD_TIME_DIAS": int(lead_time_days),
+            "COBERTURA_DIAS": int(cobertura_days),
             "STOCK_AL_INGRESO": stock_ing,
-            "DEMANDA_30D_POST_LLEGADA": dem_30,
+            "DEMANDA_COBERTURA_POST_LLEGADA": dem_cov,
             "FALTANTE": faltante,
             "QTY_A_COMPRAR": qty,
         })
 
     plan = pd.DataFrame(rows)
 
-    # KPIs del plan
     total_qty = int(plan["QTY_A_COMPRAR"].sum()) if len(plan) else 0
     skus_compra = int((plan["QTY_A_COMPRAR"] > 0).sum()) if len(plan) else 0
 
@@ -402,8 +409,8 @@ def plan_purchase_f3_2_default120(
         "F3_STAGE": "F3_2_PURCHASE_PLAN",
         "EMISSION_DATE": emission_date.date().isoformat(),
         "ARRIVAL_DATE": arrival_date.date().isoformat(),
-        "COVERAGE_DAYS": COVERAGE_DAYS,
-        "LEAD_TIME_DEFAULT_DAYS": LEAD_TIME_DEFAULT_DAYS,
+        "COBERTURA_DIAS": int(cobertura_days),
+        "LEAD_TIME_DIAS": int(lead_time_days),
         "TOTAL_QTY_TO_BUY": total_qty,
         "SKUS_WITH_BUY_QTY": skus_compra,
     }
