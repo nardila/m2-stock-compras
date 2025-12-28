@@ -19,7 +19,9 @@ from engine_f2 import (
 
 from engine_f3 import (
     simulate_f3_1_baseline,
-    plan_purchase_f3_2_default120,
+    plan_purchase_f3_2_scenario,
+    LEAD_TIME_DEFAULT_DAYS,
+    COVERAGE_DEFAULT_DAYS,
 )
 
 RUNS_DIR = "runs"
@@ -106,7 +108,8 @@ def to_json_safe_month_map(month_map: dict) -> dict:
     return safe
 
 
-def build_run_log_base(run_id: str, created_at: datetime, input_files_meta, fecha_corte_override_iso: str | None):
+def build_run_log_base(run_id: str, created_at: datetime, input_files_meta, fecha_corte_override_iso: str | None,
+                       lead_time_days: int, cobertura_days: int):
     fecha_corte_default = created_at.date().isoformat()
     fecha_corte_efectiva = fecha_corte_override_iso or fecha_corte_default
     return {
@@ -116,12 +119,20 @@ def build_run_log_base(run_id: str, created_at: datetime, input_files_meta, fech
         "FECHA_CORTE_OVERRIDE": fecha_corte_override_iso,
         "FECHA_CORTE_EFECTIVA": fecha_corte_efectiva,
         "OVERRIDE_ACTIVO": bool(fecha_corte_override_iso),
+
+        # Requisito anexo: trazabilidad obligatoria del escenario por RUN
+        "PARAMETROS_RUN": {
+            "FECHA_CORTE_OVERRIDE": fecha_corte_override_iso,
+            "LEAD_TIME_DIAS": int(lead_time_days),
+            "COBERTURA_DIAS": int(cobertura_days),
+        },
+
         "INPUT_FILES": input_files_meta,
         "STATUS": None,
         "VALIDATIONS": [],
         "PARAMS_EFECTIVOS": {},
         "COUNTS": {},
-        "NOTES": "F2: validaciones duras. F3.1: simulación baseline. F3.2: plan de compra (default LT=120).",
+        "NOTES": "F2: validaciones duras. F3.1: simulación baseline. F3.2: plan compra parametrizable por RUN.",
         "F3": {
             "STATUS": None,
             "KPIS_F3_1": {},
@@ -147,7 +158,7 @@ st.set_page_config(page_title="IA Operativa — Módulo 2 (FASE 2/3)", layout="w
 ensure_dirs()
 
 st.title("IA Operativa — Módulo 2: Stock y Compras (FASE 2/3)")
-st.caption("F2: validaciones duras. F3.1: simulación baseline. F3.2: plan compra default LT=120, cobertura=30 post-llegada.")
+st.caption("F2: validaciones duras. F3: escenarios por RUN (LT y cobertura) + trazabilidad en run_log.json.")
 
 uploaded = st.file_uploader("Subí los archivos (xlsx)", accept_multiple_files=True, type=["xlsx"])
 
@@ -157,30 +168,65 @@ if uploaded:
 
     with a:
         modulo_central_name = st.selectbox("Modulo Central.xlsx", ["(no seleccionado)"] + names, 0)
-        proyeccion_name = st.selectbox("PROYECCION - SKU  MAYO 2026.xlsx", ["(no seleccionado)"] + names, 0)
+        proyeccion_name = st.selectbox("PROYECCION.xlsx", ["(no seleccionado)"] + names, 0)
 
     with b:
         importaciones_name = st.selectbox("Importaciones.xlsx", ["(no seleccionado)"] + names, 0)
         fecha_override = st.date_input("FECHA_CORTE_OVERRIDE (opcional)", value=None)
         fecha_override_iso = fecha_override.isoformat() if fecha_override else None
 
+    # Parámetros de escenario (visibles antes de RUN)
+    st.markdown("### Escenario (por RUN)")
+    c1, c2 = st.columns(2)
+    with c1:
+        lead_time_days = st.number_input(
+            "LEAD_TIME_DIAS",
+            min_value=0,
+            max_value=365,
+            value=int(LEAD_TIME_DEFAULT_DAYS),
+            step=1,
+        )
+    with c2:
+        cobertura_days = st.number_input(
+            "COBERTURA_DIAS",
+            min_value=1,
+            max_value=120,
+            value=int(COVERAGE_DEFAULT_DAYS),
+            step=1,
+        )
+
+    # Resumen visible del escenario efectivo
+    fecha_corte_preview = fecha_override_iso or date.today().isoformat()
+    st.info(
+        f"Escenario efectivo → FECHA_CORTE: {fecha_corte_preview} | "
+        f"LEAD_TIME_DIAS: {int(lead_time_days)} | COBERTURA_DIAS: {int(cobertura_days)}"
+    )
+
     selected = [modulo_central_name, proyeccion_name, importaciones_name]
-    can_run = "(no seleccionado)" not in selected and len(set(selected)) == 3
+    can_run_files = "(no seleccionado)" not in selected and len(set(selected)) == 3
+
+    # Bloqueo ante inválidos (anexo)
+    valid_params = (lead_time_days is not None and cobertura_days is not None
+                    and int(lead_time_days) >= 0 and int(cobertura_days) >= 1)
+
+    can_run = can_run_files and valid_params
 
     mode = st.radio(
         "Modo de ejecución",
         [
             "FASE 2 (solo validaciones)",
             "FASE 3.1 (simulación baseline sin compras)",
-            "FASE 3.2 (plan de compra default LT=120)",
+            "FASE 3.2 (plan de compra con escenario)",
         ],
         index=2,
         horizontal=True,
-        disabled=not can_run
+        disabled=not can_run_files
     )
 
-    if not can_run:
+    if not can_run_files:
         st.warning("Mapeo incompleto o repetido. Corregí para habilitar RUN.")
+    if can_run_files and not valid_params:
+        st.error("Parámetros inválidos. Ajustá LEAD_TIME_DIAS y COBERTURA_DIAS para continuar.")
 
     if st.button("🚀 RUN", type="primary", disabled=not can_run):
         created_at = now_ts()
@@ -192,7 +238,10 @@ if uploaded:
         os.makedirs(outputs_dir, exist_ok=True)
 
         meta = save_uploaded_files(run_path, uploaded)
-        run_log = build_run_log_base(run_id, created_at, meta, fecha_override_iso)
+        run_log = build_run_log_base(
+            run_id, created_at, meta, fecha_override_iso,
+            int(lead_time_days), int(cobertura_days)
+        )
 
         name_to_path = {m["original_name"]: m["stored_path"] for m in meta}
         modulo_central_path = name_to_path[modulo_central_name]
@@ -214,6 +263,8 @@ if uploaded:
 
         try:
             fecha_corte_efectiva = datetime.fromisoformat(run_log["FECHA_CORTE_EFECTIVA"]).date()
+            lt = int(run_log["PARAMETROS_RUN"]["LEAD_TIME_DIAS"])
+            cov = int(run_log["PARAMETROS_RUN"]["COBERTURA_DIAS"])
 
             # ===== FASE 2 (siempre) =====
             stock_df, mtd_df = read_stock_and_mtd(modulo_central_path)
@@ -245,6 +296,8 @@ if uploaded:
                     modulo_central_path=modulo_central_path,
                     importaciones_path=importaciones_path,
                     fecha_corte=fecha_corte_efectiva,
+                    lead_time_days=lt,
+                    cobertura_days=cov,
                 )
                 validation_report["NOTICES"].extend(issues_to_dict(f3_notices_1))
                 if sim_df is not None and len(sim_df) > 0:
@@ -255,10 +308,12 @@ if uploaded:
 
             # ===== F3.2 =====
             if mode.startswith("FASE 3.2"):
-                plan_df, kpis_2, f3_notices_2 = plan_purchase_f3_2_default120(
+                plan_df, kpis_2, f3_notices_2 = plan_purchase_f3_2_scenario(
                     simulation_df=sim_df,
                     fecha_corte=fecha_corte_efectiva,
                     proyeccion_path=proyeccion_path,
+                    lead_time_days=lt,
+                    cobertura_days=cov,
                 )
                 validation_report["NOTICES"].extend(issues_to_dict(f3_notices_2))
                 if plan_df is not None and len(plan_df) > 0:
@@ -281,7 +336,6 @@ if uploaded:
             run_log["STATUS"] = "ERROR_F2"
             run_log["F3"]["STATUS"] = "SKIPPED_DUE_TO_TECH_ERROR"
 
-        # Persistir
         write_json(os.path.join(run_path, "validation_report.json"), validation_report)
         write_json(os.path.join(run_path, "run_log.json"), run_log)
 
