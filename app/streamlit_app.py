@@ -13,6 +13,7 @@ from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
+from PIL import Image  # <- FIX: render robusto
 
 from engine_f2 import (
     HardValidationError,
@@ -79,12 +80,6 @@ def write_json(path: str, obj: dict):
 
 # -----------------------------
 # CSV Output Contract (F3.x)
-# - max 2 decimales
-# - redondeo estándar (half-up)
-# - sin notación científica
-# - UTF-8
-# - decimal '.'
-# - NO redondear cálculos internos: solo copia exportada
 # -----------------------------
 
 def _round_half_up_2dp(x):
@@ -121,7 +116,7 @@ def write_csv_f3(path: str, df: pd.DataFrame):
         path,
         index=False,
         encoding="utf-8",
-        float_format="%.2f",   # no sci + 2 decimales homogéneos
+        float_format="%.2f",
         lineterminator="\n"
     )
 
@@ -185,7 +180,7 @@ def build_run_log_base(run_id: str, created_at: datetime, input_files_meta, fech
         "VALIDATIONS": [],
         "PARAMS_EFECTIVOS": {},
         "COUNTS": {},
-        "NOTES": "F2: validaciones duras. F3: escenarios por RUN (LT/cobertura) + outputs CSV 2 decimales. Heatmap: diagnóstico v1.0.1.",
+        "NOTES": "F2: validaciones duras. F3: escenarios por RUN + outputs estables. Heatmap: diagnóstico v1.0.1.",
         "F3": {
             "STATUS": None,
             "KPIS_F3_1": {},
@@ -217,8 +212,7 @@ def _spanish_month_label(d: date) -> str:
 
 
 def _parse_months_from_month_map(month_map: dict) -> list[date]:
-    months = sorted({date(v.year, v.month, 1) for v in month_map.values()})
-    return months
+    return sorted({date(v.year, v.month, 1) for v in month_map.values()})
 
 
 def _stock_map_from_stock_df(stock_df: pd.DataFrame) -> dict[str, float]:
@@ -255,17 +249,10 @@ def _inbound_by_month_from_transit(transit_df: pd.DataFrame, months: list[date])
     t = t[t["MONTH"].isin(months_set)].copy()
 
     g = t.groupby(["SKU", "MONTH"], as_index=False)["Cantidad"].sum()
-    g = g.rename(columns={"Cantidad": "INBOUND"})
-    return g
+    return g.rename(columns={"Cantidad": "INBOUND"})
 
 
-def build_heatmap_cobertura_v101(
-    proj_df: pd.DataFrame,
-    month_map: dict,
-    stock_df: pd.DataFrame,
-    transit_df: pd.DataFrame,
-    order_mode: str,
-):
+def build_heatmap_cobertura_v101(proj_df, month_map, stock_df, transit_df, order_mode):
     if proj_df is None or len(proj_df) == 0 or "SKU" not in proj_df.columns:
         return [], [], np.array([[]]), np.array([[]], dtype=int), []
 
@@ -295,22 +282,18 @@ def build_heatmap_cobertura_v101(
             key = (r["SKU"], r["MONTH"])
             inbound_by[key] = inbound_by.get(key, 0.0) + float(r["INBOUND"])
 
-    S = len(skus)
-    K = len(months)
-
+    S, K = len(skus), len(months)
     coverage = np.full((S, K), np.nan, dtype=float)
-    state = np.zeros((S, K), dtype=int)  # 0=INACTIVO
+    state = np.zeros((S, K), dtype=int)
 
     total_proj = {m: 0.0 for m in months}
     total_cov = {m: 0.0 for m in months}
 
     for i, sku in enumerate(skus):
         available = float(stock_map.get(sku, 0.0))
-
         for j, m in enumerate(months):
             proj_units = float(proj_by.get((sku, m), 0.0))
             total_proj[m] += proj_units
-
             available += float(inbound_by.get((sku, m), 0.0))
 
             if proj_units <= 0:
@@ -321,7 +304,7 @@ def build_heatmap_cobertura_v101(
             available -= covered_units
             total_cov[m] += covered_units
 
-            pct = (covered_units / proj_units) * 100.0 if proj_units > 0 else 0.0
+            pct = (covered_units / proj_units) * 100.0
             pct = max(0.0, min(100.0, pct))
             coverage[i, j] = pct
 
@@ -332,7 +315,6 @@ def build_heatmap_cobertura_v101(
             else:
                 state[i, j] = 1
 
-    # Orden
     if order_mode.startswith("Criticidad"):
         avg_cov = []
         for i, sku in enumerate(skus):
@@ -349,20 +331,12 @@ def build_heatmap_cobertura_v101(
     headers = []
     for m in months:
         label = _spanish_month_label(m)
-        cov_u = int(round(total_cov[m]))
-        proj_u = int(round(total_proj[m]))
-        headers.append(f"{label} — {cov_u} / {proj_u}")
+        headers.append(f"{label} — {int(round(total_cov[m]))} / {int(round(total_proj[m]))}")
 
     return skus, months, coverage, state, headers
 
 
-def render_heatmap_png(
-    skus: list[str],
-    headers: list[str],
-    coverage: np.ndarray,
-    state: np.ndarray,
-):
-    # FIX 1: devolver None si no hay datos
+def render_heatmap_png(skus, headers, coverage, state):
     if not skus or not headers:
         return None
 
@@ -387,8 +361,7 @@ def render_heatmap_png(
             pct = coverage[i, j]
             if np.isnan(pct):
                 continue
-            txt = f"{int(round(pct))}%"
-            ax.text(j, i, txt, ha="center", va="center", fontsize=8, color="black")
+            ax.text(j, i, f"{int(round(pct))}%", ha="center", va="center", fontsize=8, color="black")
 
     ax.set_title("Heatmap de Cobertura — v1.0.1 (CANÓNICO)", fontsize=14)
     ax.set_xlabel("Mes", fontsize=11)
@@ -406,7 +379,6 @@ def render_heatmap_png(
     plt.close(fig)
     buf.seek(0)
 
-    # FIX 2: validar firma PNG antes de devolver
     png_bytes = buf.getvalue()
     if not (isinstance(png_bytes, (bytes, bytearray)) and len(png_bytes) > 8 and png_bytes[:4] == b"\x89PNG"):
         return None
@@ -417,7 +389,7 @@ st.set_page_config(page_title="IA Operativa — Módulo 2 (FASE 2/3)", layout="w
 ensure_dirs()
 
 st.title("IA Operativa — Módulo 2: Stock y Compras (FASE 2/3)")
-st.caption("F2: validaciones duras. F3: escenarios por RUN (LT/cobertura) + outputs CSV 2 decimales. Heatmap: diagnóstico v1.0.1.")
+st.caption("F2: validaciones duras. F3: escenarios por RUN + outputs estables. Heatmap: diagnóstico v1.0.1.")
 
 uploaded = st.file_uploader("Subí los archivos (xlsx)", accept_multiple_files=True, type=["xlsx"])
 
@@ -437,21 +409,9 @@ if uploaded:
     st.markdown("### Escenario (por RUN)")
     c1, c2 = st.columns(2)
     with c1:
-        lead_time_days = st.number_input(
-            "LEAD_TIME_DIAS",
-            min_value=0,
-            max_value=365,
-            value=int(LEAD_TIME_DEFAULT_DAYS),
-            step=1,
-        )
+        lead_time_days = st.number_input("LEAD_TIME_DIAS", 0, 365, int(LEAD_TIME_DEFAULT_DAYS), 1)
     with c2:
-        cobertura_days = st.number_input(
-            "COBERTURA_DIAS",
-            min_value=1,
-            max_value=120,
-            value=int(COVERAGE_DEFAULT_DAYS),
-            step=1,
-        )
+        cobertura_days = st.number_input("COBERTURA_DIAS", 1, 120, int(COVERAGE_DEFAULT_DAYS), 1)
 
     fecha_corte_preview = fecha_override_iso or date.today().isoformat()
     st.info(
@@ -461,10 +421,7 @@ if uploaded:
 
     selected = [modulo_central_name, proyeccion_name, importaciones_name]
     can_run_files = "(no seleccionado)" not in selected and len(set(selected)) == 3
-
-    valid_params = (lead_time_days is not None and cobertura_days is not None
-                    and int(lead_time_days) >= 0 and int(cobertura_days) >= 1)
-
+    valid_params = int(lead_time_days) >= 0 and int(cobertura_days) >= 1
     can_run = can_run_files and valid_params
 
     mode = st.radio(
@@ -481,16 +438,7 @@ if uploaded:
 
     st.markdown("### Heatmap de Cobertura (v1.0.1 CANÓNICO)")
     show_heatmap = st.checkbox("Mostrar Heatmap", value=True)
-    order_mode = st.selectbox(
-        "Orden de SKUs (UI)",
-        ["Alfabético", "Criticidad (menor cobertura promedio primero)"],
-        index=0
-    )
-
-    if not can_run_files:
-        st.warning("Mapeo incompleto o repetido. Corregí para habilitar RUN.")
-    if can_run_files and not valid_params:
-        st.error("Parámetros inválidos. Ajustá LEAD_TIME_DIAS y COBERTURA_DIAS para continuar.")
+    order_mode = st.selectbox("Orden de SKUs (UI)", ["Alfabético", "Criticidad (menor cobertura promedio primero)"], 0)
 
     if st.button("🚀 RUN", type="primary", disabled=not can_run):
         created_at = now_ts()
@@ -502,10 +450,7 @@ if uploaded:
         os.makedirs(outputs_dir, exist_ok=True)
 
         meta = save_uploaded_files(run_path, uploaded)
-        run_log = build_run_log_base(
-            run_id, created_at, meta, fecha_override_iso,
-            int(lead_time_days), int(cobertura_days)
-        )
+        run_log = build_run_log_base(run_id, created_at, meta, fecha_override_iso, int(lead_time_days), int(cobertura_days))
 
         name_to_path = {m["original_name"]: m["stored_path"] for m in meta}
         modulo_central_path = name_to_path[modulo_central_name]
@@ -532,7 +477,6 @@ if uploaded:
             lt = int(run_log["PARAMETROS_RUN"]["LEAD_TIME_DIAS"])
             cov = int(run_log["PARAMETROS_RUN"]["COBERTURA_DIAS"])
 
-            # ===== FASE 2 =====
             stock_df, mtd_df = read_stock_and_mtd(modulo_central_path)
             validate_mtd_month(mtd_df, fecha_corte_efectiva, modulo_central_path)
             proj_df, month_map, proj_notices = read_and_validate_projection(proyeccion_path, fecha_corte_efectiva)
@@ -550,7 +494,6 @@ if uploaded:
             validation_report["NOTICES"].extend(issues_to_dict(proj_notices))
             run_log["STATUS"] = "OK_F2"
 
-            # ===== Heatmap v1.0.1 (NO altera F3) =====
             if show_heatmap:
                 skus, months, coverage, state, headers = build_heatmap_cobertura_v101(
                     proj_df=proj_df,
@@ -564,7 +507,6 @@ if uploaded:
                     with open(os.path.join(outputs_dir, "heatmap_cobertura_v1.0.1.png"), "wb") as f:
                         f.write(heatmap_png)
 
-            # ===== F3.1 =====
             sim_df = None
             if mode.startswith("FASE 3.1") or mode.startswith("FASE 3.2"):
                 sim_df, kpis_1, f3_notices_1 = simulate_f3_1_baseline(
@@ -580,15 +522,12 @@ if uploaded:
                     cobertura_days=cov,
                 )
                 validation_report["NOTICES"].extend(issues_to_dict(f3_notices_1))
-
                 if sim_df is not None and len(sim_df) > 0:
                     write_csv_f3(os.path.join(outputs_dir, "simulation_daily.csv"), sim_df)
-
                 write_json(os.path.join(outputs_dir, "kpis_f3_1.json"), kpis_1)
                 run_log["F3"]["KPIS_F3_1"] = kpis_1
                 run_log["F3"]["STATUS"] = "OK_F3_1"
 
-            # ===== F3.2 =====
             if mode.startswith("FASE 3.2"):
                 plan_df, kpis_2, f3_notices_2 = plan_purchase_f3_2_scenario(
                     simulation_df=sim_df,
@@ -598,10 +537,8 @@ if uploaded:
                     cobertura_days=cov,
                 )
                 validation_report["NOTICES"].extend(issues_to_dict(f3_notices_2))
-
                 if plan_df is not None and len(plan_df) > 0:
                     write_csv_f3(os.path.join(outputs_dir, "purchase_plan.csv"), plan_df)
-
                 write_json(os.path.join(outputs_dir, "kpis_f3_2.json"), kpis_2)
                 run_log["F3"]["KPIS_F3_2"] = kpis_2
                 run_log["F3"]["STATUS"] = "OK_F3_2"
@@ -625,21 +562,22 @@ if uploaded:
 
         st.success(f"RUN: {run_id} — {run_log['STATUS']} — F3: {run_log['F3']['STATUS']}")
 
-        # ---- FIX UI: no crashear si PNG inválido/vacío ----
-        if isinstance(heatmap_png, (bytes, bytearray)) and len(heatmap_png) > 8 and heatmap_png[:4] == b"\x89PNG":
-            st.image(
-                heatmap_png,
-                caption="Heatmap de Cobertura — v1.0.1 (CANÓNICO)",
-                use_container_width=True
-            )
-            st.download_button(
-                "⬇️ Descargar PNG (Heatmap)",
-                data=heatmap_png,
-                file_name=f"{run_id}_heatmap_cobertura_v1.0.1.png",
-                mime="image/png",
-            )
-        elif show_heatmap:
-            st.warning("Heatmap no generado (PNG vacío o inválido). Revisar que existan meses y SKUs proyectados.")
+        # ---- FIX definitivo: render con PIL para evitar crash de Streamlit ----
+        if show_heatmap:
+            if isinstance(heatmap_png, (bytes, bytearray)) and len(heatmap_png) > 8 and heatmap_png[:4] == b"\x89PNG":
+                try:
+                    img = Image.open(io.BytesIO(heatmap_png))
+                    st.image(img, caption="Heatmap de Cobertura — v1.0.1 (CANÓNICO)", use_container_width=True)
+                    st.download_button(
+                        "⬇️ Descargar PNG (Heatmap)",
+                        data=heatmap_png,
+                        file_name=f"{run_id}_heatmap_cobertura_v1.0.1.png",
+                        mime="image/png",
+                    )
+                except Exception:
+                    st.warning("Heatmap generado pero no pudo renderizarse en la UI. Descargalo desde el ZIP (outputs/heatmap...).")
+            else:
+                st.warning("Heatmap no generado (PNG vacío o inválido). Revisar que existan meses y SKUs proyectados.")
 
         st.json(run_log)
 
