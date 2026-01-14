@@ -28,6 +28,7 @@ from engine_f2 import (
 from engine_f3 import (
     simulate_f3_1_baseline,
     plan_purchase_f3_2_scenario,
+    plan_purchase_logistico_contenedor_40hq,
     LEAD_TIME_DEFAULT_DAYS,
     COVERAGE_DEFAULT_DAYS,
 )
@@ -471,6 +472,7 @@ if uploaded:
 
     with b:
         importaciones_name = st.selectbox("Importaciones.xlsx", ["(no seleccionado)"] + names, 0)
+        info_comp_name = st.selectbox("Informacion Complementaria.xlsx (plan logístico 40HQ)", ["(no seleccionado)"] + names, 0)
         fecha_override = st.date_input("FECHA_CORTE_OVERRIDE (opcional)", value=None)
         fecha_override_iso = fecha_override.isoformat() if fecha_override else None
 
@@ -524,11 +526,15 @@ if uploaded:
         modulo_central_path = name_to_path[modulo_central_name]
         proyeccion_path = name_to_path[proyeccion_name]
         importaciones_path = name_to_path[importaciones_name]
+        info_comp_path = None
+        if info_comp_name != "(no seleccionado)":
+            info_comp_path = name_to_path.get(info_comp_name)
 
         run_log["PARAMS_EFECTIVOS"] = {
             "MODULO_CENTRAL_PATH": modulo_central_path,
             "PROYECCION_PATH": proyeccion_path,
             "IMPORTACIONES_PATH": importaciones_path,
+            "INFO_COMPLEMENTARIA_PATH": info_comp_path,
         }
 
         validation_report = {
@@ -636,6 +642,21 @@ if uploaded:
                 validation_report["NOTICES"].extend(issues_to_dict(f3_notices_2))
                 if plan_df is not None and len(plan_df) > 0:
                     write_csv_f3(os.path.join(outputs_dir, "purchase_plan.csv"), plan_df)
+                # F3.3: Plan logístico por contenedor 40HQ (NO reemplaza purchase_plan.csv)
+                if info_comp_path:
+                    sim_csv_path = os.path.join(outputs_dir, "simulation_daily.csv")
+                    plan_log_df, kpis_3, f3_notices_3 = plan_purchase_logistico_contenedor_40hq(
+                        simulation_csv_path=sim_csv_path,
+                        info_complementaria_path=info_comp_path,
+                        proyeccion_path=proyeccion_path,
+                    )
+                    validation_report["NOTICES"].extend(issues_to_dict(f3_notices_3))
+                    if plan_log_df is not None and len(plan_log_df) > 0:
+                        write_csv_f3(os.path.join(outputs_dir, "purchase_plan_logistico.csv"), plan_log_df)
+                    write_json(os.path.join(outputs_dir, "kpis_f3_3_logistico.json"), kpis_3)
+                    # logueo liviano (sin tocar contrato existente)
+                    run_log.setdefault("F3", {}).setdefault("KPIS_F3_3", {})
+                    run_log["F3"]["KPIS_F3_3"] = kpis_3
                 write_json(os.path.join(outputs_dir, "kpis_f3_2.json"), kpis_2)
                 run_log["F3"]["KPIS_F3_2"] = kpis_2
                 run_log["F3"]["STATUS"] = "OK_F3_2"
@@ -658,6 +679,16 @@ if uploaded:
         write_json(os.path.join(run_path, "run_log.json"), run_log)
 
         st.success(f"RUN: {run_id} — {run_log['STATUS']} — F3: {run_log['F3']['STATUS']}")
+
+        # Descarga rápida de planes (si existen)
+        pp_path = os.path.join(outputs_dir, "purchase_plan.csv")
+        if os.path.exists(pp_path):
+            with open(pp_path, "rb") as f:
+                st.download_button("⬇️ Descargar purchase_plan.csv (cobertura)", data=f.read(), file_name=f"{run_id}_purchase_plan.csv", mime="text/csv")
+        ppl_path = os.path.join(outputs_dir, "purchase_plan_logistico.csv")
+        if os.path.exists(ppl_path):
+            with open(ppl_path, "rb") as f:
+                st.download_button("⬇️ Descargar purchase_plan_logistico.csv (40HQ)", data=f.read(), file_name=f"{run_id}_purchase_plan_logistico.csv", mime="text/csv")
 
         # ---- Heatmaps: general + por grupo ----
         if show_heatmap:
