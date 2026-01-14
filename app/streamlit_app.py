@@ -203,146 +203,139 @@ def tech_issue(code: str, message: str):
 
 
 # -----------------------------
-# Heatmap de Cobertura v1.0.1 (CANÓNICO)
+# Heatmap Service Level mensual (CANÓNICO)
+# Fuente única: outputs/simulation_daily.csv
+#
+# Para cada SKU–Mes:
+#   DEMANDA_MES   = sum(demand)
+#   CUBIERTO_MES  = sum(fulfilled)
+#   SERVICE_LEVEL = CUBIERTO_MES / DEMANDA_MES
+#
+# Caso especial:
+#   Si DEMANDA_MES = 0 -> SKU INACTIVO ese mes (celeste)
+#
+# Visual:
+#   80%–100%  -> verde
+#   40%–79%   -> naranja
+#   0%–39%    -> rojo
+#   INACTIVO  -> celeste
 # -----------------------------
 
-def _spanish_month_label(d: date) -> str:
+def _spanish_month_label(month_start: date, include_year: bool) -> str:
     months = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
-    return f"{months[d.month - 1]} {d.year}"
+    base = months[month_start.month - 1]
+    return f"{base} {month_start.year}" if include_year else base
 
 
-def _parse_months_from_month_map(month_map: dict) -> list[date]:
-    return sorted({date(v.year, v.month, 1) for v in month_map.values()})
+def build_heatmap_service_level_from_simulation_csv(sim_csv_path: str, order_mode: str):
+    """Construye el heatmap desde outputs/simulation_daily.csv (fuente única)."""
+    if not os.path.exists(sim_csv_path):
+        return [], [], np.array([[]]), np.array([[]], dtype=int)
 
+    df = pd.read_csv(sim_csv_path)
+    required = {"date", "SKU", "demand", "fulfilled"}
+    if not required.issubset(set(df.columns)):
+        return [], [], np.array([[]]), np.array([[]], dtype=int)
 
-def _stock_map_from_stock_df(stock_df: pd.DataFrame) -> dict[str, float]:
-    stx = stock_df.copy()
-    sku_col = "STOC_SKU" if "STOC_SKU" in stx.columns else ("SKU" if "SKU" in stx.columns else None)
-    qty_col = "STOC_CANTIDAD" if "STOC_CANTIDAD" in stx.columns else (
-        "STOCK" if "STOCK" in stx.columns else ("CANTIDAD" if "CANTIDAD" in stx.columns else None)
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"]).copy()
+
+    df["SKU"] = df["SKU"].astype(str).str.strip()
+    df["demand"] = pd.to_numeric(df["demand"], errors="coerce").fillna(0.0)
+    df["fulfilled"] = pd.to_numeric(df["fulfilled"], errors="coerce").fillna(0.0)
+
+    # Mes calendario (primer día del mes)
+    df["MONTH"] = df["date"].dt.to_period("M").dt.to_timestamp().dt.date
+
+    # Agregación canónica (mensual)
+    agg = df.groupby(["SKU", "MONTH"], as_index=False).agg(
+        DEMANDA_MES=("demand", "sum"),
+        CUBIERTO_MES=("fulfilled", "sum"),
     )
-    if sku_col is None or qty_col is None:
-        return {}
 
-    stx[sku_col] = stx[sku_col].astype(str).str.strip()
-    stx[qty_col] = pd.to_numeric(stx[qty_col], errors="coerce").fillna(0.0)
-    return stx.groupby(sku_col, as_index=True)[qty_col].sum().to_dict()
-
-
-def _inbound_by_month_from_transit(transit_df: pd.DataFrame, months: list[date]) -> pd.DataFrame:
-    if transit_df is None or len(transit_df) == 0:
-        return pd.DataFrame(columns=["SKU", "MONTH", "INBOUND"])
-
-    t = transit_df.copy()
-    if "SKU" not in t.columns or "Cantidad" not in t.columns or "ETA" not in t.columns:
-        return pd.DataFrame(columns=["SKU", "MONTH", "INBOUND"])
-
-    t["SKU"] = t["SKU"].astype(str).str.strip()
-    t["Cantidad"] = pd.to_numeric(t["Cantidad"], errors="coerce").fillna(0.0)
-    t["ETA"] = pd.to_datetime(t["ETA"], errors="coerce")
-    t = t.dropna(subset=["ETA"]).copy()
-
-    t["INGRESO"] = (t["ETA"] + pd.to_timedelta(BUFFER_ETA_DIAS, unit="D")).dt.date
-    t["MONTH"] = t["INGRESO"].apply(lambda d: date(d.year, d.month, 1))
-
-    months_set = set(months)
-    t = t[t["MONTH"].isin(months_set)].copy()
-
-    g = t.groupby(["SKU", "MONTH"], as_index=False)["Cantidad"].sum()
-    return g.rename(columns={"Cantidad": "INBOUND"})
-
-
-def build_heatmap_cobertura_v101(proj_df, month_map, stock_df, transit_df, order_mode):
-    if proj_df is None or len(proj_df) == 0 or "SKU" not in proj_df.columns:
-        return [], [], np.array([[]]), np.array([[]], dtype=int), []
-
-    months = _parse_months_from_month_map(month_map)
+    # Universo de meses (ordenado)
+    months = sorted(agg["MONTH"].unique().tolist())
     if not months:
-        return [], [], np.array([[]]), np.array([[]], dtype=int), []
+        return [], [], np.array([[]]), np.array([[]], dtype=int)
 
-    p = proj_df.copy()
-    p["SKU"] = p["SKU"].astype(str).str.strip()
-    skus = sorted(p["SKU"].unique().tolist())
+    # Incluir solo SKUs con alguna demanda en el horizonte
+    total_demand_by_sku = agg.groupby("SKU")["DEMANDA_MES"].sum()
+    skus = sorted([sku for sku, td in total_demand_by_sku.items() if float(td) > 0.0])
+    if not skus:
+        return [], months, np.array([[]]), np.array([[]], dtype=int)
 
-    proj_by = {}
-    for col, m in month_map.items():
-        if col not in p.columns:
-            continue
-        vals = pd.to_numeric(p[col], errors="coerce").fillna(0.0)
-        for sku, v in zip(p["SKU"].tolist(), vals.tolist()):
-            key = (sku, date(m.year, m.month, 1))
-            proj_by[key] = proj_by.get(key, 0.0) + float(v)
-
-    stock_map = _stock_map_from_stock_df(stock_df)
-
-    inbound_month_df = _inbound_by_month_from_transit(transit_df, months)
-    inbound_by = {}
-    if len(inbound_month_df) > 0:
-        for _, r in inbound_month_df.iterrows():
-            key = (r["SKU"], r["MONTH"])
-            inbound_by[key] = inbound_by.get(key, 0.0) + float(r["INBOUND"])
+    sku_index = {s: i for i, s in enumerate(skus)}
+    month_index = {m: j for j, m in enumerate(months)}
 
     S, K = len(skus), len(months)
-    coverage = np.full((S, K), np.nan, dtype=float)
+
+    # pct: porcentaje 0-100; NaN para INACTIVO
+    pct = np.full((S, K), np.nan, dtype=float)
+    # state: 0 INACTIVO, 1 rojo, 2 naranja, 3 verde
     state = np.zeros((S, K), dtype=int)
 
-    total_proj = {m: 0.0 for m in months}
-    total_cov = {m: 0.0 for m in months}
+    for _, r in agg.iterrows():
+        sku = r["SKU"]
+        if sku not in sku_index:
+            continue
+        m = r["MONTH"]
+        i = sku_index[sku]
+        j = month_index[m]
 
-    for i, sku in enumerate(skus):
-        available = float(stock_map.get(sku, 0.0))
-        for j, m in enumerate(months):
-            proj_units = float(proj_by.get((sku, m), 0.0))
-            total_proj[m] += proj_units
-            available += float(inbound_by.get((sku, m), 0.0))
+        dem = float(r["DEMANDA_MES"])
+        ful = float(r["CUBIERTO_MES"])
 
-            if proj_units <= 0:
-                state[i, j] = 0
-                continue
+        if dem <= 0.0:
+            state[i, j] = 0
+            continue
 
-            covered_units = min(available, proj_units)
-            available -= covered_units
-            total_cov[m] += covered_units
+        sl = ful / dem
+        sl = max(0.0, min(1.0, sl))
+        v = sl * 100.0
+        pct[i, j] = v
 
-            pct = (covered_units / proj_units) * 100.0
-            pct = max(0.0, min(100.0, pct))
-            coverage[i, j] = pct
+        if v >= 80.0:
+            state[i, j] = 3
+        elif v >= 40.0:
+            state[i, j] = 2
+        else:
+            state[i, j] = 1
 
-            if pct >= 80:
-                state[i, j] = 3
-            elif pct >= 40:
-                state[i, j] = 2
-            else:
-                state[i, j] = 1
-
+    # Orden (solo UI)
     if order_mode.startswith("Criticidad"):
-        avg_cov = []
+        avg_sl = []
         for i, sku in enumerate(skus):
-            vals = coverage[i, :]
+            vals = pct[i, :]
             vals = vals[~np.isnan(vals)]
             avg = float(np.mean(vals)) if len(vals) else 0.0
-            avg_cov.append((avg, sku, i))
-        avg_cov.sort(key=lambda x: (x[0], x[1]))
-        order_idx = [x[2] for x in avg_cov]
+            avg_sl.append((avg, sku, i))
+        avg_sl.sort(key=lambda x: (x[0], x[1]))
+        order_idx = [x[2] for x in avg_sl]
         skus = [skus[i] for i in order_idx]
-        coverage = coverage[order_idx, :]
+        pct = pct[order_idx, :]
         state = state[order_idx, :]
 
-    headers = []
-    for m in months:
-        label = _spanish_month_label(m)
-        headers.append(f"{label} — {int(round(total_cov[m]))} / {int(round(total_proj[m]))}")
-
-    return skus, months, coverage, state, headers
+    return skus, months, pct, state
 
 
-def render_heatmap_png(skus, headers, coverage, state):
-    if not skus or not headers:
+def render_heatmap_service_level_png(
+    skus: list[str],
+    months: list[date],
+    pct: np.ndarray,
+    state: np.ndarray,
+) -> bytes | None:
+    if not skus or not months:
         return None
 
+    years = {m.year for m in months}
+    include_year = len(years) > 1
+    xlabels = [_spanish_month_label(m, include_year=include_year) for m in months]
+
+    # 0=INACTIVO(celeste), 1=rojo, 2=naranja, 3=verde
     cmap = ListedColormap(["#8fd3ff", "#ff6b6b", "#ffa94d", "#69db7c"])
 
-    fig_w = max(10, 1.6 * len(headers))
+    fig_w = max(10, 1.2 * len(xlabels))
     fig_h = max(6, 0.35 * len(skus))
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
@@ -351,23 +344,24 @@ def render_heatmap_png(skus, headers, coverage, state):
     ax.set_yticks(np.arange(len(skus)))
     ax.set_yticklabels(skus, fontsize=9)
 
-    ax.set_xticks(np.arange(len(headers)))
-    ax.set_xticklabels(headers, rotation=45, ha="right", fontsize=9)
+    ax.set_xticks(np.arange(len(xlabels)))
+    ax.set_xticklabels(xlabels, rotation=45, ha="right", fontsize=9)
 
+    # Texto en celdas: solo porcentaje (sin decimales). No mostrar texto en INACTIVO.
     for i in range(state.shape[0]):
         for j in range(state.shape[1]):
             if state[i, j] == 0:
                 continue
-            pct = coverage[i, j]
-            if np.isnan(pct):
+            v = pct[i, j]
+            if np.isnan(v):
                 continue
-            ax.text(j, i, f"{int(round(pct))}%", ha="center", va="center", fontsize=8, color="black")
+            ax.text(j, i, f"{int(round(v))}%", ha="center", va="center", fontsize=8, color="black")
 
-    ax.set_title("Heatmap de Cobertura — v1.0.1 (CANÓNICO)", fontsize=14)
+    ax.set_title("Heatmap Service Level mensual", fontsize=14)
     ax.set_xlabel("Mes", fontsize=11)
     ax.set_ylabel("SKU", fontsize=11)
 
-    ax.set_xticks(np.arange(-.5, len(headers), 1), minor=True)
+    ax.set_xticks(np.arange(-.5, len(xlabels), 1), minor=True)
     ax.set_yticks(np.arange(-.5, len(skus), 1), minor=True)
     ax.grid(which="minor", linestyle="-", linewidth=0.3)
     ax.tick_params(which="minor", bottom=False, left=False)
@@ -436,7 +430,7 @@ if uploaded:
         disabled=not can_run_files
     )
 
-    st.markdown("### Heatmap de Cobertura (v1.0.1 CANÓNICO)")
+    st.markdown("### Heatmap Service Level mensual (CANÓNICO)")
     show_heatmap = st.checkbox("Mostrar Heatmap", value=True)
     order_mode = st.selectbox("Orden de SKUs (UI)", ["Alfabético", "Criticidad (menor cobertura promedio primero)"], 0)
 
@@ -494,19 +488,8 @@ if uploaded:
             validation_report["NOTICES"].extend(issues_to_dict(proj_notices))
             run_log["STATUS"] = "OK_F2"
 
-            if show_heatmap:
-                skus, months, coverage, state, headers = build_heatmap_cobertura_v101(
-                    proj_df=proj_df,
-                    month_map=month_map,
-                    stock_df=stock_df,
-                    transit_df=transit_df,
-                    order_mode=order_mode,
-                )
-                heatmap_png = render_heatmap_png(skus, headers, coverage, state)
-                if heatmap_png is not None:
-                    with open(os.path.join(outputs_dir, "heatmap_cobertura_v1.0.1.png"), "wb") as f:
-                        f.write(heatmap_png)
-
+            # Heatmap: se calcula exclusivamente desde outputs/simulation_daily.csv (fuente única).
+            # Nota: si el modo es FASE 2, no existe simulation_daily.csv, por lo tanto no se genera heatmap.
             sim_df = None
             if mode.startswith("FASE 3.1") or mode.startswith("FASE 3.2"):
                 sim_df, kpis_1, f3_notices_1 = simulate_f3_1_baseline(
@@ -524,6 +507,16 @@ if uploaded:
                 validation_report["NOTICES"].extend(issues_to_dict(f3_notices_1))
                 if sim_df is not None and len(sim_df) > 0:
                     write_csv_f3(os.path.join(outputs_dir, "simulation_daily.csv"), sim_df)
+
+                    # Generar heatmap (service level mensual) desde el CSV recién exportado
+                    if show_heatmap:
+                        sim_csv_path = os.path.join(outputs_dir, "simulation_daily.csv")
+                        skus, months, pct, state = build_heatmap_service_level_from_simulation_csv(sim_csv_path, order_mode)
+                        heatmap_png = render_heatmap_service_level_png(skus, months, pct, state)
+                        if heatmap_png is not None:
+                            with open(os.path.join(outputs_dir, "heatmap_service_level.png"), "wb") as f:
+                                f.write(heatmap_png)
+
                 write_json(os.path.join(outputs_dir, "kpis_f3_1.json"), kpis_1)
                 run_log["F3"]["KPIS_F3_1"] = kpis_1
                 run_log["F3"]["STATUS"] = "OK_F3_1"
@@ -567,17 +560,17 @@ if uploaded:
             if isinstance(heatmap_png, (bytes, bytearray)) and len(heatmap_png) > 8 and heatmap_png[:4] == b"\x89PNG":
                 try:
                     img = Image.open(io.BytesIO(heatmap_png))
-                    st.image(img, caption="Heatmap de Cobertura — v1.0.1 (CANÓNICO)", use_container_width=True)
+                    st.image(img, caption="Heatmap Service Level mensual (CANÓNICO)", use_container_width=True)
                     st.download_button(
                         "⬇️ Descargar PNG (Heatmap)",
                         data=heatmap_png,
-                        file_name=f"{run_id}_heatmap_cobertura_v1.0.1.png",
+                        file_name=f"{run_id}_heatmap_service_level.png",
                         mime="image/png",
                     )
                 except Exception:
-                    st.warning("Heatmap generado pero no pudo renderizarse en la UI. Descargalo desde el ZIP (outputs/heatmap...).")
+                    st.warning("Heatmap generado pero no pudo renderizarse en la UI. Descargalo desde el ZIP (outputs/heatmap_service_level.png).")
             else:
-                st.warning("Heatmap no generado (PNG vacío o inválido). Revisar que existan meses y SKUs proyectados.")
+                st.warning("Heatmap no generado (PNG vacío o inválido). Revisar que exista simulation_daily.csv (ejecutar FASE 3) y que haya demanda en el horizonte.")
 
         st.json(run_log)
 
