@@ -4,6 +4,7 @@ import json
 import zipfile
 from datetime import datetime, date, timedelta
 import hashlib
+import re
 import secrets
 import streamlit as st
 import pandas as pd
@@ -220,103 +221,168 @@ def tech_issue(code: str, message: str):
 #   0%–39%    -> rojo
 #   INACTIVO  -> celeste
 # -----------------------------
-
 def _spanish_month_label(month_start: date, include_year: bool) -> str:
     months = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
     base = months[month_start.month - 1]
     return f"{base} {month_start.year}" if include_year else base
 
 
-def build_heatmap_service_level_from_simulation_csv(sim_csv_path: str, order_mode: str):
-    """Construye el heatmap desde outputs/simulation_daily.csv (fuente única)."""
+def _fmt_units_es(x: float) -> str:
+    """Formatea unidades para eje X: entero redondeado, separador de miles con '.'"""
+    try:
+        n = int(round(float(x)))
+    except Exception:
+        n = 0
+    s = f"{n:,}".replace(",", ".")
+    return s
+
+
+def _sanitize_filename_component(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return "SIN_GRUPO"
+    # Reemplazar espacios y caracteres raros
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^A-Za-z0-9_\-\.]", "_", s)
+    return s[:80]
+
+
+def read_sku_groups_from_projection(proyeccion_path: str) -> dict[str, str]:
+    """Lee PROYECCION.xlsx (hoja GENERAL, columna GRUPO) para mapear SKU -> GRUPO.
+    No afecta la lógica de F3: se usa solo para filtrar SKUs en heatmaps por grupo.
+    """
+    try:
+        df = pd.read_excel(proyeccion_path, sheet_name="GENERAL")
+    except Exception:
+        return {}
+
+    # Columnas esperadas
+    if "SKU" not in df.columns or "GRUPO" not in df.columns:
+        return {}
+
+    m = {}
+    for _, r in df.iterrows():
+        sku = str(r.get("SKU", "")).strip()
+        grp = str(r.get("GRUPO", "")).strip()
+        if sku:
+            m[sku] = grp
+    return m
+
+
+def build_heatmap_service_level_from_simulation_csv(
+    sim_csv_path: str,
+    order_mode: str,
+    sku_whitelist: set[str] | None = None,
+):
+    """Construye el heatmap *exclusivamente* desde outputs/simulation_daily.csv (fuente única).
+
+    Para cada SKU–Mes:
+      DEMANDA_MES   = sum(demand)
+      CUBIERTO_MES  = sum(fulfilled)
+      SERVICE_LEVEL = CUBIERTO_MES / DEMANDA_MES
+
+    Casos especiales:
+      DEMANDA_MES = 0 -> INACTIVO (celeste)
+
+    Además devuelve totales mensuales (CUBIERTO/DEMANDA) para el eje X:
+      - general: total de todos los SKUs
+      - por grupo: total de SKUs del grupo
+    """
     if not os.path.exists(sim_csv_path):
-        return [], [], np.array([[]]), np.array([[]], dtype=int)
+        return [], [], np.array([[]]), np.array([[]], dtype=int), [], []
 
     df = pd.read_csv(sim_csv_path)
     required = {"date", "SKU", "demand", "fulfilled"}
     if not required.issubset(set(df.columns)):
-        return [], [], np.array([[]]), np.array([[]], dtype=int)
+        return [], [], np.array([[]]), np.array([[]], dtype=int), [], []
 
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date"]).copy()
 
     df["SKU"] = df["SKU"].astype(str).str.strip()
+    if sku_whitelist is not None:
+        df = df[df["SKU"].isin(set(sku_whitelist))].copy()
+
     df["demand"] = pd.to_numeric(df["demand"], errors="coerce").fillna(0.0)
     df["fulfilled"] = pd.to_numeric(df["fulfilled"], errors="coerce").fillna(0.0)
 
-    # Mes calendario (primer día del mes)
-    df["MONTH"] = df["date"].dt.to_period("M").dt.to_timestamp().dt.date
+    if len(df) == 0:
+        return [], [], np.array([[]]), np.array([[]], dtype=int), [], []
 
-    # Agregación canónica (mensual)
-    agg = df.groupby(["SKU", "MONTH"], as_index=False).agg(
-        DEMANDA_MES=("demand", "sum"),
-        CUBIERTO_MES=("fulfilled", "sum"),
+    df["month"] = df["date"].dt.to_period("M").dt.to_timestamp().dt.date
+
+    # Totales mensuales (para eje X)
+    month_tot = (
+        df.groupby("month", as_index=False)[["demand", "fulfilled"]]
+        .sum()
+        .sort_values("month")
     )
 
-    # Universo de meses (ordenado)
-    months = sorted(agg["MONTH"].unique().tolist())
-    if not months:
-        return [], [], np.array([[]]), np.array([[]], dtype=int)
+    months = [date(m.year, m.month, 1) for m in month_tot["month"].tolist()]
 
-    # Incluir solo SKUs con alguna demanda en el horizonte
-    total_demand_by_sku = agg.groupby("SKU")["DEMANDA_MES"].sum()
-    skus = sorted([sku for sku, td in total_demand_by_sku.items() if float(td) > 0.0])
-    if not skus:
-        return [], months, np.array([[]]), np.array([[]], dtype=int)
+    # Agregado mensual por SKU
+    agg = (
+        df.groupby(["SKU", "month"], as_index=False)[["demand", "fulfilled"]]
+        .sum()
+        .sort_values(["SKU", "month"])
+    )
+
+    skus = sorted(agg["SKU"].unique().tolist())
+    if not skus or not months:
+        return [], months, np.array([[]]), np.array([[]], dtype=int),             month_tot["fulfilled"].tolist(), month_tot["demand"].tolist()
 
     sku_index = {s: i for i, s in enumerate(skus)}
     month_index = {m: j for j, m in enumerate(months)}
 
     S, K = len(skus), len(months)
 
-    # pct: porcentaje 0-100; NaN para INACTIVO
-    pct = np.full((S, K), np.nan, dtype=float)
-    # state: 0 INACTIVO, 1 rojo, 2 naranja, 3 verde
-    state = np.zeros((S, K), dtype=int)
+    pct = np.full((S, K), np.nan, dtype=float)  # porcentaje 0-100; NaN para INACTIVO
+    state = np.zeros((S, K), dtype=int)         # 0 INACTIVO, 1 rojo, 2 naranja, 3 verde
 
     for _, r in agg.iterrows():
         sku = r["SKU"]
-        if sku not in sku_index:
+        m = date(r["month"].year, r["month"].month, 1)
+        if sku not in sku_index or m not in month_index:
             continue
-        m = r["MONTH"]
+
         i = sku_index[sku]
         j = month_index[m]
+        dem = float(r["demand"])
+        cov = float(r["fulfilled"])
 
-        dem = float(r["DEMANDA_MES"])
-        ful = float(r["CUBIERTO_MES"])
-
-        if dem <= 0.0:
+        if dem <= 0:
             state[i, j] = 0
+            pct[i, j] = np.nan
             continue
 
-        sl = ful / dem
+        sl = cov / dem
         sl = max(0.0, min(1.0, sl))
-        v = sl * 100.0
-        pct[i, j] = v
+        p = sl * 100.0
+        pct[i, j] = p
 
-        if v >= 80.0:
+        if p >= 80:
             state[i, j] = 3
-        elif v >= 40.0:
+        elif p >= 40:
             state[i, j] = 2
         else:
             state[i, j] = 1
 
     # Orden (solo UI)
     if order_mode.startswith("Criticidad"):
-        avg_sl = []
+        avg = []
         for i, sku in enumerate(skus):
             vals = pct[i, :]
             vals = vals[~np.isnan(vals)]
-            avg = float(np.mean(vals)) if len(vals) else 0.0
-            avg_sl.append((avg, sku, i))
-        avg_sl.sort(key=lambda x: (x[0], x[1]))
-        order_idx = [x[2] for x in avg_sl]
+            a = float(np.mean(vals)) if len(vals) else 0.0
+            avg.append((a, sku, i))
+        avg.sort(key=lambda x: (x[0], x[1]))
+        order_idx = [x[2] for x in avg]
         skus = [skus[i] for i in order_idx]
         pct = pct[order_idx, :]
         state = state[order_idx, :]
 
-    return skus, months, pct, state
+    return skus, months, pct, state, month_tot["fulfilled"].tolist(), month_tot["demand"].tolist()
 
 
 def render_heatmap_service_level_png(
@@ -324,18 +390,27 @@ def render_heatmap_service_level_png(
     months: list[date],
     pct: np.ndarray,
     state: np.ndarray,
+    month_fulfilled: list[float],
+    month_demand: list[float],
 ) -> bytes | None:
     if not skus or not months:
         return None
 
     years = {m.year for m in months}
     include_year = len(years) > 1
-    xlabels = [_spanish_month_label(m, include_year=include_year) for m in months]
+
+    # Eje X: MES + (CUBIERTO / DEMANDA) agregados a nivel heatmap
+    xlabels = []
+    for i, m in enumerate(months):
+        mes = _spanish_month_label(m, include_year=include_year)
+        cov = month_fulfilled[i] if i < len(month_fulfilled) else 0.0
+        dem = month_demand[i] if i < len(month_demand) else 0.0
+        xlabels.append(f"{mes}\n({_fmt_units_es(cov)} / {_fmt_units_es(dem)})")
 
     # 0=INACTIVO(celeste), 1=rojo, 2=naranja, 3=verde
     cmap = ListedColormap(["#8fd3ff", "#ff6b6b", "#ffa94d", "#69db7c"])
 
-    fig_w = max(10, 1.2 * len(xlabels))
+    fig_w = max(10, 1.3 * len(xlabels))
     fig_h = max(6, 0.35 * len(skus))
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
@@ -345,9 +420,9 @@ def render_heatmap_service_level_png(
     ax.set_yticklabels(skus, fontsize=9)
 
     ax.set_xticks(np.arange(len(xlabels)))
-    ax.set_xticklabels(xlabels, rotation=45, ha="right", fontsize=9)
+    ax.set_xticklabels(xlabels, rotation=0, ha="center", fontsize=9)
 
-    # Texto en celdas: solo porcentaje (sin decimales). No mostrar texto en INACTIVO.
+    # Texto en celda: % sin decimales. INACTIVO no muestra texto.
     for i in range(state.shape[0]):
         for j in range(state.shape[1]):
             if state[i, j] == 0:
@@ -377,7 +452,6 @@ def render_heatmap_service_level_png(
     if not (isinstance(png_bytes, (bytes, bytearray)) and len(png_bytes) > 8 and png_bytes[:4] == b"\x89PNG"):
         return None
     return png_bytes
-
 
 st.set_page_config(page_title="IA Operativa — Módulo 2 (FASE 2/3)", layout="wide")
 ensure_dirs()
@@ -464,7 +538,8 @@ if uploaded:
             "MONTH_COLUMNS_MAP": {},
         }
 
-        heatmap_png = None
+        heatmap_png_general = None
+        heatmap_png_by_group = {}
 
         try:
             fecha_corte_efectiva = datetime.fromisoformat(run_log["FECHA_CORTE_EFECTIVA"]).date()
@@ -508,15 +583,44 @@ if uploaded:
                 if sim_df is not None and len(sim_df) > 0:
                     write_csv_f3(os.path.join(outputs_dir, "simulation_daily.csv"), sim_df)
 
-                    # Generar heatmap (service level mensual) desde el CSV recién exportado
+                    # Generar heatmaps (Service Level mensual) desde el CSV recién exportado
+                    # - 1 general (todos los SKUs)
+                    # - 1 por cada GRUPO definido en PROYECCION.xlsx (hoja GENERAL, columna GRUPO)
+                    # Fuente única: outputs/simulation_daily.csv
                     if show_heatmap:
                         sim_csv_path = os.path.join(outputs_dir, "simulation_daily.csv")
-                        skus, months, pct, state = build_heatmap_service_level_from_simulation_csv(sim_csv_path, order_mode)
-                        heatmap_png = render_heatmap_service_level_png(skus, months, pct, state)
-                        if heatmap_png is not None:
-                            with open(os.path.join(outputs_dir, "heatmap_service_level.png"), "wb") as f:
-                                f.write(heatmap_png)
 
+                        # Heatmap general
+                        skus, months, pct, state, m_ful, m_dem = build_heatmap_service_level_from_simulation_csv(
+                            sim_csv_path, order_mode, sku_whitelist=None
+                        )
+                        heatmap_png_general = render_heatmap_service_level_png(skus, months, pct, state, m_ful, m_dem)
+                        if heatmap_png_general is not None:
+                            with open(os.path.join(outputs_dir, "heatmap_service_level_general.png"), "wb") as f:
+                                f.write(heatmap_png_general)
+
+                        # Heatmaps por grupo (filtrado SOLO por SKU)
+                        sku_to_group = read_sku_groups_from_projection(proyeccion_path)
+                        # Considerar solo grupos con al menos 1 SKU presente en la simulación
+                        sim_df_tmp = pd.read_csv(sim_csv_path, usecols=["SKU"])
+                        sim_skus = set(sim_df_tmp["SKU"].astype(str).str.strip().unique().tolist())
+                        group_names = sorted({(g or "").strip() for s, g in sku_to_group.items() if s in sim_skus})
+
+                        for grp in group_names:
+                            whitelist = {s for s, g in sku_to_group.items() if s in sim_skus and (g or "").strip() == grp}
+                            if not whitelist:
+                                continue
+                            skus_g, months_g, pct_g, state_g, m_ful_g, m_dem_g = build_heatmap_service_level_from_simulation_csv(
+                                sim_csv_path, order_mode, sku_whitelist=set(whitelist)
+                            )
+                            png_g = render_heatmap_service_level_png(skus_g, months_g, pct_g, state_g, m_ful_g, m_dem_g)
+                            if png_g is None:
+                                continue
+                            safe_grp = _sanitize_filename_component(grp)
+                            out_name = f"heatmap_service_level_{safe_grp}.png"
+                            with open(os.path.join(outputs_dir, out_name), "wb") as f:
+                                f.write(png_g)
+                            heatmap_png_by_group[grp] = png_g
                 write_json(os.path.join(outputs_dir, "kpis_f3_1.json"), kpis_1)
                 run_log["F3"]["KPIS_F3_1"] = kpis_1
                 run_log["F3"]["STATUS"] = "OK_F3_1"
@@ -555,22 +659,42 @@ if uploaded:
 
         st.success(f"RUN: {run_id} — {run_log['STATUS']} — F3: {run_log['F3']['STATUS']}")
 
-        # ---- FIX definitivo: render con PIL para evitar crash de Streamlit ----
+        # ---- Heatmaps: general + por grupo ----
         if show_heatmap:
-            if isinstance(heatmap_png, (bytes, bytearray)) and len(heatmap_png) > 8 and heatmap_png[:4] == b"\x89PNG":
+            if isinstance(heatmap_png_general, (bytes, bytearray)) and len(heatmap_png_general) > 8 and heatmap_png_general[:4] == b"\x89PNG":
                 try:
-                    img = Image.open(io.BytesIO(heatmap_png))
-                    st.image(img, caption="Heatmap Service Level mensual (CANÓNICO)", use_container_width=True)
+                    img = Image.open(io.BytesIO(heatmap_png_general))
+                    st.image(img, caption="Heatmap Service Level mensual — General", use_container_width=True)
                     st.download_button(
-                        "⬇️ Descargar PNG (Heatmap)",
-                        data=heatmap_png,
-                        file_name=f"{run_id}_heatmap_service_level.png",
+                        "⬇️ Descargar PNG (General)",
+                        data=heatmap_png_general,
+                        file_name=f"{run_id}_heatmap_service_level_general.png",
                         mime="image/png",
                     )
                 except Exception:
-                    st.warning("Heatmap generado pero no pudo renderizarse en la UI. Descargalo desde el ZIP (outputs/heatmap_service_level.png).")
+                    st.warning("Heatmap general generado pero no pudo renderizarse. Descargalo desde el ZIP (outputs/heatmap_service_level_general.png).")
+
+                # Heatmaps por grupo
+                if heatmap_png_by_group:
+                    for grp in sorted(heatmap_png_by_group.keys(), key=lambda x: (str(x).strip().lower())):
+                        png_g = heatmap_png_by_group[grp]
+                        if not (isinstance(png_g, (bytes, bytearray)) and len(png_g) > 8 and png_g[:4] == b"\x89PNG"):
+                            continue
+                        safe_grp = _sanitize_filename_component(str(grp))
+                        with st.expander(f"Grupo: {grp}"):
+                            try:
+                                img_g = Image.open(io.BytesIO(png_g))
+                                st.image(img_g, caption=f"Heatmap Service Level mensual — {grp}", use_container_width=True)
+                                st.download_button(
+                                    f"⬇️ Descargar PNG ({grp})",
+                                    data=png_g,
+                                    file_name=f"{run_id}_heatmap_service_level_{safe_grp}.png",
+                                    mime="image/png",
+                                )
+                            except Exception:
+                                st.warning(f"Heatmap del grupo {grp} generado pero no pudo renderizarse. Descargalo desde el ZIP (outputs/heatmap_service_level_{safe_grp}.png).")
             else:
-                st.warning("Heatmap no generado (PNG vacío o inválido). Revisar que exista simulation_daily.csv (ejecutar FASE 3) y que haya demanda en el horizonte.")
+                st.warning("Heatmaps no generados. Verificá que exista outputs/simulation_daily.csv (ejecutar FASE 3) y que haya demanda en el horizonte.")
 
         st.json(run_log)
 
