@@ -453,15 +453,53 @@ def plan_purchase_logistico_contenedor_40hq(
     """
     notices: List[ValidationIssue] = []
 
-    def _col(df: pd.DataFrame, wanted: str) -> str:
-        # match exact or case-insensitive column names (robustez, sin cambiar reglas)
+    def _norm(s: str) -> str:
+        s = str(s).strip().lower()
+        return re.sub(r"[^a-z0-9]+", "", s)
+
+    def _col(df: pd.DataFrame, wanted: str, aliases: List[str] | None = None) -> str:
+        # match exact / case-insensitive / normalized (+ aliases explícitos)
         if wanted in df.columns:
             return wanted
-        lower_map = {str(c).strip().lower(): c for c in df.columns}
+        cols = list(df.columns)
+        lower_map = {str(c).strip().lower(): c for c in cols}
         key = wanted.strip().lower()
         if key in lower_map:
             return lower_map[key]
-        raise KeyError(f"No se encontró columna '{wanted}' en {list(df.columns)}")
+        norm_map = {_norm(c): c for c in cols}
+        w_norm = _norm(wanted)
+        if w_norm in norm_map:
+            return norm_map[w_norm]
+        if aliases:
+            for a in aliases:
+                a_key = str(a).strip().lower()
+                if a_key in lower_map:
+                    return lower_map[a_key]
+                a_norm = _norm(a)
+                if a_norm in norm_map:
+                    return norm_map[a_norm]
+        raise KeyError(f"No se encontró columna '{wanted}' (o alias {aliases}) en {list(df.columns)}")
+
+    def _find_sheet(sheet_names: List[str], wanted: str, aliases: List[str] | None = None) -> str:
+        if wanted in sheet_names:
+            return wanted
+        lower_map = {str(s).strip().lower(): s for s in sheet_names}
+        k = wanted.strip().lower()
+        if k in lower_map:
+            return lower_map[k]
+        norm_map = {_norm(s): s for s in sheet_names}
+        w_norm = _norm(wanted)
+        if w_norm in norm_map:
+            return norm_map[w_norm]
+        if aliases:
+            for a in aliases:
+                a_l = str(a).strip().lower()
+                if a_l in lower_map:
+                    return lower_map[a_l]
+                a_n = _norm(a)
+                if a_n in norm_map:
+                    return norm_map[a_n]
+        raise KeyError(f"No se encontró hoja '{wanted}' (o alias {aliases}) en {sheet_names}")
 
 
     # --- Leer simulation_daily.csv ---
@@ -500,7 +538,13 @@ def plan_purchase_logistico_contenedor_40hq(
 
     # --- Leer Informacion Complementaria.xlsx ---
     try:
-        sku_meta = pd.read_excel(info_complementaria_path, sheet_name="SKU-ESPECIFICACIONES")
+        xl = pd.ExcelFile(info_complementaria_path)
+        sheet_sku = _find_sheet(
+            xl.sheet_names,
+            wanted="SKU-ESPECIFICACIONES",
+            aliases=["SKU - Especificaciones", "SKU  Especificaciones", "SKU Especificaciones", "SKU- Especificaciones", "SKU_ESPECIFICACIONES"],
+        )
+        sku_meta = pd.read_excel(info_complementaria_path, sheet_name=sheet_sku)
     except Exception as e:
         notices.append(_issue(
             file=info_complementaria_path, sheet="SKU-ESPECIFICACIONES", column="(STRUCTURE)", bad_rows=[],
@@ -513,9 +557,9 @@ def plan_purchase_logistico_contenedor_40hq(
         needed_meta = ["SKU", "PROVEEDOR", "VOLUMEN_M3"]
     try:
         c_sku = _col(sku_meta, "SKU")
-        c_prov = _col(sku_meta, "PROVEEDOR")
-        c_vol = _col(sku_meta, "VOLUMEN_M3")
-        c_fob = _col(sku_meta, "FOB")
+        c_prov = _col(sku_meta, "PROVEEDOR", aliases=["Proveedor", "PROVEEDOR "])
+        c_vol = _col(sku_meta, "VOLUMEN_M3", aliases=["Volumen (m3)", "Volumen (m³)", "VOLUMEN (M3)", "Volumen m3", "VOLUMEN_M3 "])
+        c_fob = _col(sku_meta, "FOB", aliases=["Fob", "FOB "])
     except Exception as e:
         notices.append(_issue(
             file=info_complementaria_path, sheet="SKU-ESPECIFICACIONES", column="(STRUCTURE)", bad_rows=[],
