@@ -515,6 +515,7 @@ def plan_purchase_logistico_contenedor_40hq(
         c_sku = _col(sku_meta, "SKU")
         c_prov = _col(sku_meta, "PROVEEDOR")
         c_vol = _col(sku_meta, "VOLUMEN_M3")
+        c_fob = _col(sku_meta, "FOB")
     except Exception as e:
         notices.append(_issue(
             file=info_complementaria_path, sheet="SKU-ESPECIFICACIONES", column="(STRUCTURE)", bad_rows=[],
@@ -531,11 +532,12 @@ def plan_purchase_logistico_contenedor_40hq(
         ))
         return pd.DataFrame(), {"status": "NO_DATA"}, notices
 
-    sku_meta = sku_meta[[c_sku, c_prov, c_vol]].copy()
-    sku_meta = sku_meta.rename(columns={c_sku:"SKU", c_prov:"PROVEEDOR", c_vol:"VOLUMEN_M3"})
+    sku_meta = sku_meta[[c_sku, c_prov, c_vol, c_fob]].copy()
+    sku_meta = sku_meta.rename(columns={c_sku:"SKU", c_prov:"PROVEEDOR", c_vol:"VOLUMEN_M3", c_fob:"FOB"})
     sku_meta["SKU"] = _safe_strip_series(sku_meta["SKU"])
     sku_meta["PROVEEDOR"] = sku_meta["PROVEEDOR"].astype(str).str.strip()
     sku_meta["VOLUMEN_M3"] = pd.to_numeric(sku_meta["VOLUMEN_M3"], errors="coerce")
+    sku_meta["FOB"] = pd.to_numeric(sku_meta["FOB"], errors="coerce")
 
     bad_vol = sku_meta[sku_meta["VOLUMEN_M3"].isna() | (sku_meta["VOLUMEN_M3"] <= 0)].copy()
     if not bad_vol.empty:
@@ -583,6 +585,7 @@ def plan_purchase_logistico_contenedor_40hq(
     # --- Map SKU -> proveedor, volumen ---
     sku_to_provider = dict(zip(sku_meta["SKU"], sku_meta["PROVEEDOR"]))
     sku_to_vol = dict(zip(sku_meta["SKU"], sku_meta["VOLUMEN_M3"]))
+    sku_to_fob = dict(zip(sku_meta["SKU"], sku_meta["FOB"]))
 
     sim = sim[sim["SKU"].isin(set(sku_to_provider.keys()))].copy()
     if sim.empty:
@@ -621,22 +624,42 @@ def plan_purchase_logistico_contenedor_40hq(
             if current_vol + 1e-9 < capacity_m3:
                 return False  # no hay contenedor completo
             # filas por SKU
+                        # Totales del contenedor (para auditoría)
+            volumen_total_contenedor = float(current_vol)
+            fob_total_contenedor = 0.0
+            for _sku, _units in units_by_sku.items():
+                _fob = sku_to_fob.get(_sku)
+                if _fob is not None and pd.notna(_fob):
+                    fob_total_contenedor += float(_units) * float(_fob)
+
+            # filas por SKU
             vol_acc = 0.0
             for sku, units in units_by_sku.items():
                 vpu = float(sku_to_vol[sku])
                 vol = float(units) * vpu
                 vol_acc += vol
+
+                fob_unitario = sku_to_fob.get(sku)
+                fob_total_linea = None
+                if fob_unitario is not None and pd.notna(fob_unitario):
+                    fob_total_linea = float(units) * float(fob_unitario)
+
                 out_rows.append({
                     "proveedor": str(prov).strip(),
                     "numero_contenedor": int(container_num),
+                    "numero_orden": int(container_num),
                     "SKU": sku,
                     "unidades": float(units),
                     "volumen_m3": float(vol),
                     "volumen_acumulado_contenedor": float(vol_acc),
+                    "volumen_total_contenedor": float(volumen_total_contenedor),
+                    "fob_unitario": float(fob_unitario) if (fob_unitario is not None and pd.notna(fob_unitario)) else None,
+                    "fob_total_linea": float(fob_total_linea) if fob_total_linea is not None else None,
+                    "fob_total_contenedor": float(fob_total_contenedor),
                     "fecha_inicio_quiebre": container_start_date.isoformat() if container_start_date else None,
                     "fecha_llegada_objetivo": (container_start_date - timedelta(days=15)).isoformat() if container_start_date else None,
                 })
-            # reset
+# reset
             container_num += 1
             current_vol = 0.0
             container_start_date = None
