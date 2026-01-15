@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from math import ceil
 from typing import Dict, List, Tuple
+
 import re
 
 import pandas as pd
@@ -417,53 +418,52 @@ def plan_purchase_f3_2_scenario(
     }
 
     return plan, kpis, notices
-
-# ---------------------------------------------------------------------------
-# F3.3 (Extensión operativa): Purchase Plan Logístico por Contenedor (40HQ)
-# ---------------------------------------------------------------------------
-
-def _sanitize_provider_name(x: str) -> str:
-    x = (x or "").strip()
-    if not x:
-        return "SIN_PROVEEDOR"
-    # archivo-safe
-    x = re.sub(r"[^\w\-]+", "_", x, flags=re.UNICODE)
-    x = re.sub(r"_+", "_", x).strip("_")
-    return x or "SIN_PROVEEDOR"
-
-
 def plan_purchase_logistico_contenedor_40hq(
-    *,
-    simulation_csv_path: str,
+    simulation_daily_csv_path: str,
     info_complementaria_path: str,
-    proyeccion_path: str,
-) -> Tuple[pd.DataFrame, dict, List[ValidationIssue]]:
+) -> Tuple[pd.DataFrame, Dict, List[ValidationIssue]]:
     """
-    F3.x (extensión operativa, NO reemplaza F3.2):
-      - Fuente única timeline: outputs/simulation_daily.csv (lost_sales por día)
-      - Fuente única metadata: Informacion Complementaria.xlsx
-          - SKU-ESPECIFICACIONES: SKU, PROVEEDOR, VOLUMEN_M3
-          - OPCIONES_LOGISTICAS: tipo == "CONTENEDOR 40 HQ" -> CAPACIDAD_M3 (=68)
-      - Agrupa por proveedor y arma contenedores completos en orden temporal
-      - FECHA_LLEGADA_OBJETIVO = 15 días antes del primer quiebre cubierto por el contenedor
+    F3.3 (extensión operativa): Purchase plan logístico por contenedor 40HQ (68 m3),
+    usando EXCLUSIVAMENTE:
+      - outputs/simulation_daily.csv (lost_sales día a día)
+      - Informacion Complementaria.xlsx (SKU -> PROVEEDOR, VOLUMEN_M3, FOB + opciones logísticas)
 
-    Output:
-      proveedor, numero_contenedor, SKU, unidades, volumen_m3,
-      volumen_acumulado_contenedor, fecha_inicio_quiebre, fecha_llegada_objetivo
+    No modifica F3.1 / F3.2. Es un output paralelo.
     """
     notices: List[ValidationIssue] = []
 
     def _norm(s: str) -> str:
-        s = str(s).strip().lower()
-        return re.sub(r"[^a-z0-9]+", "", s)
+        return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
+
+    def _find_sheet(sheet_names: List[str], wanted: str, aliases: List[str] | None = None) -> str:
+        if wanted in sheet_names:
+            return wanted
+        lower_map = {str(s).strip().lower(): s for s in sheet_names}
+        key = str(wanted).strip().lower()
+        if key in lower_map:
+            return lower_map[key]
+        norm_map = {_norm(s): s for s in sheet_names}
+        w_norm = _norm(wanted)
+        if w_norm in norm_map:
+            return norm_map[w_norm]
+        if aliases:
+            for a in aliases:
+                a_key = str(a).strip().lower()
+                if a in sheet_names:
+                    return a
+                if a_key in lower_map:
+                    return lower_map[a_key]
+                a_norm = _norm(a)
+                if a_norm in norm_map:
+                    return norm_map[a_norm]
+        raise KeyError(f"No se encontró hoja '{wanted}' (o alias {aliases}) en {sheet_names}")
 
     def _col(df: pd.DataFrame, wanted: str, aliases: List[str] | None = None) -> str:
-        # match exact / case-insensitive / normalized (+ aliases explícitos)
         if wanted in df.columns:
             return wanted
         cols = list(df.columns)
         lower_map = {str(c).strip().lower(): c for c in cols}
-        key = wanted.strip().lower()
+        key = str(wanted).strip().lower()
         if key in lower_map:
             return lower_map[key]
         norm_map = {_norm(c): c for c in cols}
@@ -472,122 +472,93 @@ def plan_purchase_logistico_contenedor_40hq(
             return norm_map[w_norm]
         if aliases:
             for a in aliases:
+                if a in cols:
+                    return a
                 a_key = str(a).strip().lower()
                 if a_key in lower_map:
                     return lower_map[a_key]
                 a_norm = _norm(a)
                 if a_norm in norm_map:
                     return norm_map[a_norm]
-        raise KeyError(f"No se encontró columna '{wanted}' (o alias {aliases}) en {list(df.columns)}")
+        raise KeyError(f"No se encontró columna '{wanted}' (o alias {aliases}) en {cols}")
 
-    def _find_sheet(sheet_names: List[str], wanted: str, aliases: List[str] | None = None) -> str:
-        if wanted in sheet_names:
-            return wanted
-        lower_map = {str(s).strip().lower(): s for s in sheet_names}
-        k = wanted.strip().lower()
-        if k in lower_map:
-            return lower_map[k]
-        norm_map = {_norm(s): s for s in sheet_names}
-        w_norm = _norm(wanted)
-        if w_norm in norm_map:
-            return norm_map[w_norm]
-        if aliases:
-            for a in aliases:
-                a_l = str(a).strip().lower()
-                if a_l in lower_map:
-                    return lower_map[a_l]
-                a_n = _norm(a)
-                if a_n in norm_map:
-                    return norm_map[a_n]
-        raise KeyError(f"No se encontró hoja '{wanted}' (o alias {aliases}) en {sheet_names}")
-
-
-    # --- Leer simulation_daily.csv ---
+    # 1) Leer simulation_daily.csv (fuente única de quiebres)
     try:
-        sim = pd.read_csv(simulation_csv_path)
+        sim = pd.read_csv(simulation_daily_csv_path)
     except Exception as e:
         notices.append(_issue(
-            file=simulation_csv_path, sheet="(csv)", column="(STRUCTURE)", bad_rows=[],
-            code="F3_3_SIMULATION_CSV_READ_ERROR",
+            file=simulation_daily_csv_path, sheet="(csv)", column="(READ)", bad_rows=[],
+            code="F3_3_SIM_READ_ERROR",
             message=f"F3.3: no se pudo leer simulation_daily.csv: {type(e).__name__}: {e}",
             type_="TECH_ERROR"
         ))
         return pd.DataFrame(), {"status": "NO_DATA"}, notices
 
-    required_sim_cols = ["date", "SKU", "lost_sales"]
-    missing = [c for c in required_sim_cols if c not in sim.columns]
-    if missing:
+    required_cols = {"date", "SKU", "lost_sales"}
+    if not required_cols.issubset(set(sim.columns)):
         notices.append(_issue(
-            file=simulation_csv_path, sheet="(csv)", column="(STRUCTURE)", bad_rows=[],
-            code="F3_3_SIMULATION_CSV_MISSING_COLS",
-            message=f"F3.3: faltan columnas en simulation_daily.csv: {missing}",
+            file=simulation_daily_csv_path, sheet="(csv)", column="(STRUCTURE)", bad_rows=[],
+            code="F3_3_SIM_MISSING_COLS",
+            message=f"F3.3: simulation_daily.csv no tiene columnas requeridas {sorted(required_cols)}. Tiene: {list(sim.columns)}",
             type_="TECH_ERROR"
         ))
         return pd.DataFrame(), {"status": "NO_DATA"}, notices
 
-    sim["date"] = pd.to_datetime(sim["date"], errors="coerce")
-    sim["SKU"] = _safe_strip_series(sim["SKU"])
+    sim["SKU"] = sim["SKU"].astype(str).str.strip()
     sim["lost_sales"] = pd.to_numeric(sim["lost_sales"], errors="coerce").fillna(0.0)
+    sim["date"] = pd.to_datetime(sim["date"], errors="coerce")
     sim = sim.dropna(subset=["date"]).copy()
     sim["date"] = sim["date"].dt.date
 
-    # quedarnos solo con días con quiebre real
     sim = sim[sim["lost_sales"] > 0].copy()
     if sim.empty:
         return pd.DataFrame(), {"status": "NO_BREAKS"}, notices
 
-    # --- Leer Informacion Complementaria.xlsx ---
+    # 2) Leer Informacion Complementaria.xlsx (metadata única)
     try:
         xl = pd.ExcelFile(info_complementaria_path)
-        sheet_sku = _find_sheet(
-            xl.sheet_names,
-            wanted="SKU-ESPECIFICACIONES",
-            aliases=["SKU - Especificaciones", "SKU  Especificaciones", "SKU Especificaciones", "SKU- Especificaciones", "SKU_ESPECIFICACIONES"],
-        )
-        sku_meta = pd.read_excel(info_complementaria_path, sheet_name=sheet_sku)
     except Exception as e:
         notices.append(_issue(
-            file=info_complementaria_path, sheet="SKU-ESPECIFICACIONES", column="(STRUCTURE)", bad_rows=[],
-            code="F3_3_META_READ_ERROR",
-            message=f"F3.3: no se pudo leer hoja SKU-ESPECIFICACIONES: {type(e).__name__}: {e}",
+            file=info_complementaria_path, sheet="(excel)", column="(READ)", bad_rows=[],
+            code="F3_3_META_OPEN_ERROR",
+            message=f"F3.3: no se pudo abrir Informacion Complementaria.xlsx: {type(e).__name__}: {e}",
             type_="TECH_ERROR"
         ))
         return pd.DataFrame(), {"status": "NO_DATA"}, notices
 
-        needed_meta = ["SKU", "PROVEEDOR", "VOLUMEN_M3"]
+    # 2a) SKU-ESPECIFICACIONES
     try:
+        sheet_sku = _find_sheet(
+            xl.sheet_names,
+            wanted="SKU-ESPECIFICACIONES",
+            aliases=["SKU - Especificaciones", "SKU  Especificaciones", "SKU Especificaciones", "SKU_ESPECIFICACIONES"],
+        )
+        sku_meta = pd.read_excel(info_complementaria_path, sheet_name=sheet_sku)
         c_sku = _col(sku_meta, "SKU")
-        c_prov = _col(sku_meta, "PROVEEDOR", aliases=["Proveedor", "PROVEEDOR "])
-        c_vol = _col(sku_meta, "VOLUMEN_M3", aliases=["Volumen (m3)", "Volumen (m³)", "VOLUMEN (M3)", "Volumen m3", "VOLUMEN_M3 "])
-        c_fob = _col(sku_meta, "FOB", aliases=["Fob", "FOB "])
+        c_prov = _col(sku_meta, "PROVEEDOR", aliases=["Proveedor"])
+        c_vol = _col(sku_meta, "VOLUMEN_M3", aliases=["Volumen (m3)", "Volumen (m³)", "Volumen m3", "VOLUMEN (M3)"])
+        c_fob = _col(sku_meta, "FOB", aliases=["Fob"])
     except Exception as e:
         notices.append(_issue(
             file=info_complementaria_path, sheet="SKU-ESPECIFICACIONES", column="(STRUCTURE)", bad_rows=[],
-            code="F3_3_META_MISSING_COLS",
-            message=f"F3.3: faltan columnas en SKU-ESPECIFICACIONES: {type(e).__name__}: {e}",
-            type_="TECH_ERROR"
-        ))
-        return pd.DataFrame(), {"status": "NO_DATA"}, notices
-        notices.append(_issue(
-            file=info_complementaria_path, sheet="SKU-ESPECIFICACIONES", column="(STRUCTURE)", bad_rows=[],
-            code="F3_3_META_MISSING_COLS",
-            message=f"F3.3: faltan columnas en SKU-ESPECIFICACIONES: {miss_meta}",
+            code="F3_3_META_SHEET_OR_COL_MISSING",
+            message=f"F3.3: no se pudo leer metadata SKU-ESPECIFICACIONES (hoja/columnas): {type(e).__name__}: {e}",
             type_="TECH_ERROR"
         ))
         return pd.DataFrame(), {"status": "NO_DATA"}, notices
 
     sku_meta = sku_meta[[c_sku, c_prov, c_vol, c_fob]].copy()
-    sku_meta = sku_meta.rename(columns={c_sku:"SKU", c_prov:"PROVEEDOR", c_vol:"VOLUMEN_M3", c_fob:"FOB"})
-    sku_meta["SKU"] = _safe_strip_series(sku_meta["SKU"])
+    sku_meta = sku_meta.rename(columns={c_sku: "SKU", c_prov: "PROVEEDOR", c_vol: "VOLUMEN_M3", c_fob: "FOB"})
+    sku_meta["SKU"] = sku_meta["SKU"].astype(str).str.strip()
     sku_meta["PROVEEDOR"] = sku_meta["PROVEEDOR"].astype(str).str.strip()
     sku_meta["VOLUMEN_M3"] = pd.to_numeric(sku_meta["VOLUMEN_M3"], errors="coerce")
     sku_meta["FOB"] = pd.to_numeric(sku_meta["FOB"], errors="coerce")
 
-    bad_vol = sku_meta[sku_meta["VOLUMEN_M3"].isna() | (sku_meta["VOLUMEN_M3"] <= 0)].copy()
-    if not bad_vol.empty:
-        bad_rows = bad_vol.index.tolist()[:200]
+    bad_vol = sku_meta[sku_meta["VOLUMEN_M3"].isna() | (sku_meta["VOLUMEN_M3"] <= 0)]
+    if len(bad_vol) > 0:
         notices.append(_issue(
-            file=info_complementaria_path, sheet="SKU-ESPECIFICACIONES", column="VOLUMEN_M3", bad_rows=bad_rows,
+            file=info_complementaria_path, sheet="SKU-ESPECIFICACIONES", column="VOLUMEN_M3",
+            bad_rows=bad_vol.index.tolist(),
             code="F3_3_BAD_VOLUMEN_M3",
             message="F3.3: hay SKUs con VOLUMEN_M3 vacío o <= 0; se excluirán del plan logístico.",
             type_="DATA_ERROR"
@@ -597,14 +568,25 @@ def plan_purchase_logistico_contenedor_40hq(
     if sku_meta.empty:
         return pd.DataFrame(), {"status": "NO_META"}, notices
 
-    # capacidad 40HQ
+    # 2b) OPCIONES_LOGISTICAS: capacidad 40HQ
     capacity_m3 = None
     try:
-        opts = pd.read_excel(info_complementaria_path, sheet_name="OPCIONES_LOGISTICAS")
-        c_tipo = _col(opts, "tipo")
-        c_cap = _col(opts, "CAPACIDAD_M3")
+        sheet_opts = _find_sheet(
+            xl.sheet_names,
+            wanted="OPCIONES_LOGISTICAS",
+            aliases=["Opciones logisticas", "Opciones logísticas", "OPCIONES LOGISTICAS", "Opciones Logisticas"],
+        )
+        opts = pd.read_excel(info_complementaria_path, sheet_name=sheet_opts)
+
+        c_tipo = _col(opts, "tipo", aliases=["Producto", "TIPO", "Tipo"])
+        c_cap = _col(opts, "CAPACIDAD_M3", aliases=["Capacidad Maxima", "Capacidad máxima", "CAPACIDAD MAXIMA", "Capacidad", "CAPACIDAD"])
         opts[c_tipo] = opts[c_tipo].astype(str).str.strip()
-        row = opts[opts[c_tipo].str.upper() == "CONTENEDOR 40 HQ"].head(1)
+        opts["_tipo_norm"] = opts[c_tipo].astype(str).apply(_norm)
+
+        target_norm = _norm("CONTENEDOR 40 HQ")
+        row = opts[opts["_tipo_norm"] == target_norm].head(1)
+        if len(row) == 0:
+            row = opts[opts["_tipo_norm"].str.contains("contenedor40hq", na=False)].head(1)
         if len(row) == 0:
             raise KeyError('No se encontró tipo="CONTENEDOR 40 HQ"')
         capacity_m3 = float(pd.to_numeric(row.iloc[0][c_cap], errors="coerce"))
@@ -626,139 +608,135 @@ def plan_purchase_logistico_contenedor_40hq(
         ))
         return pd.DataFrame(), {"status": "NO_DATA"}, notices
 
-    # --- Map SKU -> proveedor, volumen ---
-    sku_to_provider = dict(zip(sku_meta["SKU"], sku_meta["PROVEEDOR"]))
+    # 3) Unir quiebres con metadata (proveedor + volumen + FOB)
+    sim = sim.merge(
+        sku_meta[["SKU", "PROVEEDOR", "VOLUMEN_M3", "FOB"]],
+        on="SKU",
+        how="left",
+    )
+
+    sim = sim.dropna(subset=["PROVEEDOR", "VOLUMEN_M3"]).copy()
+    sim = sim[sim["VOLUMEN_M3"] > 0].copy()
+    if sim.empty:
+        return pd.DataFrame(), {"status": "NO_MATCHING_SKUS"}, notices
+
+    # helpers rápidos para lookups
     sku_to_vol = dict(zip(sku_meta["SKU"], sku_meta["VOLUMEN_M3"]))
     sku_to_fob = dict(zip(sku_meta["SKU"], sku_meta["FOB"]))
 
-    sim = sim[sim["SKU"].isin(set(sku_to_provider.keys()))].copy()
-    if sim.empty:
-        notices.append(_issue(
-            file=simulation_csv_path, sheet="(csv)", column="SKU", bad_rows=[],
-            code="F3_3_NO_MATCHING_SKUS",
-            message="F3.3: ningún SKU con quiebres coincide con SKU-ESPECIFICACIONES; no se genera plan logístico.",
-            type_="DATA_ERROR"
-        ))
-        return pd.DataFrame(), {"status": "NO_MATCH"}, notices
-
-    sim["PROVEEDOR"] = sim["SKU"].map(sku_to_provider)
-    sim["VOLUMEN_M3"] = sim["SKU"].map(sku_to_vol)
-    sim["volumen_dia"] = sim["lost_sales"] * sim["VOLUMEN_M3"]
-
-    # --- Construcción de contenedores por proveedor ---
-    out_rows = []
+    # 4) Construcción de contenedores por proveedor, en orden temporal
+    out_rows: List[Dict] = []
     providers = sorted(sim["PROVEEDOR"].dropna().unique().tolist(), key=lambda x: str(x).strip().lower())
 
     for prov in providers:
         dfp = sim[sim["PROVEEDOR"] == prov].copy()
         if dfp.empty:
             continue
-
         dfp = dfp.sort_values(["date", "SKU"]).reset_index(drop=True)
 
         container_num = 1
         current_vol = 0.0
-        container_start_date = None
-
-        # acumulación por SKU dentro del contenedor actual
+        container_start_date: date | None = None
         units_by_sku: Dict[str, float] = {}
 
-        def _flush_container():
+        def _flush_container() -> bool:
             nonlocal container_num, current_vol, container_start_date, units_by_sku
-            if current_vol + 1e-9 < capacity_m3:
-                return False  # no hay contenedor completo
-            # filas por SKU
-                        # Totales del contenedor (para auditoría)
-            volumen_total_contenedor = float(current_vol)
-            fob_total_contenedor = 0.0
-            for _sku, _units in units_by_sku.items():
-                _fob = sku_to_fob.get(_sku)
-                if _fob is not None and pd.notna(_fob):
-                    fob_total_contenedor += float(_units) * float(_fob)
 
-            # filas por SKU
+            # solo emitimos contenedores completos
+            if current_vol + 1e-9 < capacity_m3:
+                return False
+
+            vol_total = float(current_vol)
+            fob_total = 0.0
             vol_acc = 0.0
-            for sku, units in units_by_sku.items():
-                vpu = float(sku_to_vol[sku])
-                vol = float(units) * vpu
+
+            # orden estable para auditoría
+            for sku in sorted(units_by_sku.keys()):
+                units = float(units_by_sku[sku])
+                vpu = float(sku_to_vol.get(sku, 0.0))
+                vol = units * vpu
                 vol_acc += vol
 
-                fob_unitario = sku_to_fob.get(sku)
-                fob_total_linea = None
-                if fob_unitario is not None and pd.notna(fob_unitario):
-                    fob_total_linea = float(units) * float(fob_unitario)
+                fob_unit = sku_to_fob.get(sku)
+                fob_unit = float(fob_unit) if (fob_unit is not None and pd.notna(fob_unit)) else None
+                fob_line = (units * fob_unit) if (fob_unit is not None) else None
+                if fob_line is not None:
+                    fob_total += float(fob_line)
 
                 out_rows.append({
                     "proveedor": str(prov).strip(),
                     "numero_contenedor": int(container_num),
                     "numero_orden": int(container_num),
-                    "SKU": sku,
+
+                    "SKU": str(sku).strip(),
                     "unidades": float(units),
                     "volumen_m3": float(vol),
+
                     "volumen_acumulado_contenedor": float(vol_acc),
-                    "volumen_total_contenedor": float(volumen_total_contenedor),
-                    "fob_unitario": float(fob_unitario) if (fob_unitario is not None and pd.notna(fob_unitario)) else None,
-                    "fob_total_linea": float(fob_total_linea) if fob_total_linea is not None else None,
-                    "fob_total_contenedor": float(fob_total_contenedor),
+                    "volumen_total_contenedor": float(vol_total),
+
+                    "fob_unitario": float(fob_unit) if fob_unit is not None else None,
+                    "fob_total_linea": float(fob_line) if fob_line is not None else None,
+                    "fob_total_contenedor": float(fob_total),
+
                     "fecha_inicio_quiebre": container_start_date.isoformat() if container_start_date else None,
                     "fecha_llegada_objetivo": (container_start_date - timedelta(days=15)).isoformat() if container_start_date else None,
                 })
-# reset
+
+            # reset para próximo contenedor
             container_num += 1
             current_vol = 0.0
             container_start_date = None
             units_by_sku = {}
             return True
 
-        # Iterar día por día (pero ya filtrado a lost_sales>0)
+        # Iterar día por día (lost_sales>0 ya filtrado)
         for _, r in dfp.iterrows():
-            d = r["date"]
-            sku = r["SKU"]
-            lost = float(r["lost_sales"])
+            d: date = r["date"]
+            sku: str = str(r["SKU"]).strip()
+            remaining_units = float(r["lost_sales"])
             vpu = float(r["VOLUMEN_M3"])
-            if lost <= 0 or vpu <= 0:
-                continue
 
-            # inicializar start date del contenedor al primer quiebre que entra
+            if remaining_units <= 0:
+                continue
             if container_start_date is None:
                 container_start_date = d
 
-            # volumen a asignar de este registro (puede partirse entre contenedores)
-            remaining_units = lost
-            while remaining_units > 0:
+            # puede partir un mismo día entre contenedores
+            while remaining_units > 1e-12:
                 remaining_capacity = capacity_m3 - current_vol
-                if remaining_capacity <= 1e-12:
-                    # contenedor lleno, flush
+                if remaining_capacity <= 1e-9:
                     _flush_container()
-                    continue
+                    # nuevo contenedor (mismo día)
+                    if container_start_date is None:
+                        container_start_date = d
+                    remaining_capacity = capacity_m3 - current_vol
 
                 max_units_fit = remaining_capacity / vpu
                 take_units = remaining_units if remaining_units <= max_units_fit else max_units_fit
 
-                # acumular
                 units_by_sku[sku] = units_by_sku.get(sku, 0.0) + take_units
                 current_vol += take_units * vpu
                 remaining_units -= take_units
 
-                # si llegamos (o pasamos por epsilon) a capacidad, cerramos contenedor
                 if current_vol + 1e-9 >= capacity_m3:
                     _flush_container()
-                    # el próximo contenedor, si queda remanente, arranca en el mismo día
+                    # si queda remanente, arranca el siguiente contenedor en el mismo día
                     if remaining_units > 0 and container_start_date is None:
                         container_start_date = d
 
-        # Al final, NO emitir contenedor incompleto (regla: llenar completos)
-        # (se descarta remanente)
+        # si queda contenedor incompleto al final, NO se emite (regla: contenedores completos)
 
     out_df = pd.DataFrame(out_rows)
+    if out_df.empty:
+        return out_df, {"status": "NO_CONTAINERS"}, notices
 
-    # KPIs simples
     kpis = {
-        "F3_STAGE": "F3_3_PURCHASE_PLAN_LOGISTICO_40HQ",
-        "CAPACIDAD_M3": float(capacity_m3),
-        "TOTAL_PROVEEDORES": int(len(out_df["proveedor"].unique())) if len(out_df) else 0,
-        "TOTAL_CONTENEDORES": int(out_df.groupby(["proveedor", "numero_contenedor"]).ngroups) if len(out_df) else 0,
-        "TOTAL_LINEAS": int(len(out_df)),
+        "status": "OK",
+        "proveedores": int(out_df["proveedor"].nunique()),
+        "ordenes_total": int(out_df["numero_orden"].nunique()),
+        "unidades_total": float(out_df["unidades"].sum()),
+        "volumen_total_m3": float(out_df["volumen_m3"].sum()),
+        "capacidad_contenedor_m3": float(capacity_m3),
     }
-
     return out_df, kpis, notices
