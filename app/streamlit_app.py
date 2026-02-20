@@ -621,7 +621,14 @@ if uploaded:
 
         created_at_iso = f"{fecha_corte_efectiva_iso}T00:00:00"
 
+        stage_run_basename = os.path.basename(stage_run_path)
+
         os.rename(stage_run_path, run_path)
+
+        # Actualizar rutas guardadas (meta) tras mover de STAGE_* a RUN_* (sin usar reloj del sistema)
+        for m in meta:
+            if isinstance(m.get("stored_path"), str):
+                m["stored_path"] = m["stored_path"].replace(f"runs/{stage_run_basename}/", f"runs/{os.path.basename(run_path)}/", 1)
 
         outputs_dir = os.path.join(run_path, "outputs")
         run_log = build_run_log_base(run_id, created_at_iso, fecha_corte_default_iso, meta, fecha_override_iso,
