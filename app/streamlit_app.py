@@ -2,7 +2,7 @@ import os
 import io
 import json
 import zipfile
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 import hashlib
 import re
 
