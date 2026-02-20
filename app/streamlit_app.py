@@ -2,10 +2,10 @@ import os
 import io
 import json
 import zipfile
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
 import hashlib
 import re
-import secrets
+
 import streamlit as st
 import pandas as pd
 
@@ -43,12 +43,10 @@ def ensure_dirs():
     os.makedirs(RUNS_DIR, exist_ok=True)
 
 
-def now_ts():
-    return datetime.now()
-
-
-def make_run_id(dt: datetime) -> str:
-    return f"RUN_{dt.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(4)}"
+def make_run_id(fecha_corte_iso: str, suffix: str) -> str:
+    # Determinístico: deriva SOLO de FECHA_CORTE_EFECTIVA + hash de inputs/params
+    ymd = fecha_corte_iso.replace('-', '')
+    return f"RUN_{ymd}_{suffix}"
 
 
 def sha256_bytes(b: bytes) -> str:
@@ -159,14 +157,13 @@ def to_json_safe_month_map(month_map: dict) -> dict:
     return safe
 
 
-def build_run_log_base(run_id: str, created_at: datetime, input_files_meta, fecha_corte_override_iso: str | None,
-                       lead_time_days: int, cobertura_days: int):
-    fecha_corte_default = created_at.date().isoformat()
-    fecha_corte_efectiva = fecha_corte_override_iso or fecha_corte_default
+def build_run_log_base(run_id: str, created_at_iso: str, fecha_corte_default_iso: str, input_files_meta,
+                       fecha_corte_override_iso: str | None, lead_time_days: int, cobertura_days: int):
+    fecha_corte_efectiva = fecha_corte_override_iso or fecha_corte_default_iso
     return {
         "RUN_ID": run_id,
-        "CREATED_AT": created_at.isoformat(timespec="seconds"),
-        "FECHA_CORTE_DEFAULT": fecha_corte_default,
+        "CREATED_AT": created_at_iso,
+        "FECHA_CORTE_DEFAULT": fecha_corte_default_iso,
         "FECHA_CORTE_OVERRIDE": fecha_corte_override_iso,
         "FECHA_CORTE_EFECTIVA": fecha_corte_efectiva,
         "OVERRIDE_ACTIVO": bool(fecha_corte_override_iso),
@@ -483,7 +480,7 @@ if uploaded:
     with c2:
         cobertura_days = st.number_input("COBERTURA_DIAS", 1, 120, int(COVERAGE_DEFAULT_DAYS), 1)
 
-    fecha_corte_preview = fecha_override_iso or date.today().isoformat()
+    fecha_corte_preview = fecha_override_iso or "(AUTO desde MTD)"
     st.info(
         f"Escenario efectivo → FECHA_CORTE: {fecha_corte_preview} | "
         f"LEAD_TIME_DIAS: {int(lead_time_days)} | COBERTURA_DIAS: {int(cobertura_days)}"
@@ -511,16 +508,62 @@ if uploaded:
     order_mode = st.selectbox("Orden de SKUs (UI)", ["Alfabético", "Criticidad (menor cobertura promedio primero)"], 0)
 
     if st.button("🚀 RUN", type="primary", disabled=not can_run):
-        created_at = now_ts()
-        run_id = make_run_id(created_at)
-        run_path = os.path.join(RUNS_DIR, run_id)
-        os.makedirs(run_path, exist_ok=False)
+        # --- Determinismo contractual (Candado A) ---
+# 1) Se crea un folder de staging basado en hash de inputs (sin reloj del sistema)
+# 2) Se infiere FECHA_CORTE_DEFAULT desde MODULO CENTRAL (max FECHA_DESPACHO) si no hay override
+# 3) RUN_ID y CREATED_AT derivan SOLO de FECHA_CORTE_EFECTIVA + hash (sin reloj_del_sistema)
+combined = hashlib.sha256()
+for uf in uploaded:
+    combined.update(uf.name.encode("utf-8"))
+    combined.update(b"\x00")
+    combined.update(uf.getvalue())
+combined.update(f"|LT={int(lead_time_days)}|COV={int(cobertura_days)}".encode("utf-8"))
+combined_suffix = combined.hexdigest()[:8]
 
-        outputs_dir = os.path.join(run_path, "outputs")
-        os.makedirs(outputs_dir, exist_ok=True)
+stage_run_id = f"STAGE_{combined_suffix}"
+stage_run_path = os.path.join(RUNS_DIR, stage_run_id)
+# evitar colisiones sin reloj: sufijo incremental
+if os.path.exists(stage_run_path):
+    k = 2
+    while os.path.exists(f"{stage_run_path}_{k}"):
+        k += 1
+    stage_run_path = f"{stage_run_path}_{k}"
 
-        meta = save_uploaded_files(run_path, uploaded)
-        run_log = build_run_log_base(run_id, created_at, meta, fecha_override_iso, int(lead_time_days), int(cobertura_days))
+os.makedirs(stage_run_path, exist_ok=False)
+outputs_dir = os.path.join(stage_run_path, "outputs")
+os.makedirs(outputs_dir, exist_ok=True)
+
+meta = save_uploaded_files(stage_run_path, uploaded)
+
+# Inferencia determinística de FECHA_CORTE_DEFAULT desde MTD (max FECHA_DESPACHO)
+try:
+    _, mtd_df = read_stock_and_mtd(modulo_central_path)
+    if mtd_df.empty:
+        raise ValueError("MTD vacío: no se puede inferir FECHA_CORTE_DEFAULT.")
+    fecha_corte_default = pd.to_datetime(mtd_df["FECHA_DESPACHO"]).max().date()
+except Exception as e:
+    raise RuntimeError(f"No se pudo inferir FECHA_CORTE_DEFAULT desde MODULO CENTRAL: {str(e)}")
+
+fecha_corte_default_iso = fecha_corte_default.isoformat()
+fecha_corte_efectiva_iso = fecha_override_iso or fecha_corte_default_iso
+
+run_id = make_run_id(fecha_corte_efectiva_iso, combined_suffix)
+run_path = os.path.join(RUNS_DIR, run_id)
+if os.path.exists(run_path):
+    k = 2
+    while os.path.exists(f"{run_path}_{k}"):
+        k += 1
+    run_path = f"{run_path}_{k}"
+    run_id = os.path.basename(run_path)
+
+created_at_iso = f"{fecha_corte_efectiva_iso}T00:00:00"
+
+os.rename(stage_run_path, run_path)
+
+outputs_dir = os.path.join(run_path, "outputs")
+run_log = build_run_log_base(run_id, created_at_iso, fecha_corte_default_iso, meta, fecha_override_iso,
+                           int(lead_time_days), int(cobertura_days))
+
 
         name_to_path = {m["original_name"]: m["stored_path"] for m in meta}
         modulo_central_path = name_to_path[modulo_central_name]
@@ -573,7 +616,7 @@ if uploaded:
             # Nota: si el modo es FASE 2, no existe simulation_daily.csv, por lo tanto no se genera heatmap.
             sim_df = None
             if mode.startswith("FASE 3.1") or mode.startswith("FASE 3.2"):
-                sim_df, kpis_1, f3_notices_1 = simulate_f3_1_baseline(
+                sim_df, kpis_1, f3_notices_1, f3_extra = simulate_f3_1_baseline(
                     stock_df=stock_df,
                     mtd_df=mtd_df,
                     proj_df=proj_df,
@@ -581,6 +624,7 @@ if uploaded:
                     proyeccion_path=proyeccion_path,
                     modulo_central_path=modulo_central_path,
                     importaciones_path=importaciones_path,
+                    info_comp_path=info_comp_path,
                     fecha_corte=fecha_corte_efectiva,
                     lead_time_days=lt,
                     cobertura_days=cov,
@@ -588,6 +632,19 @@ if uploaded:
                 validation_report["NOTICES"].extend(issues_to_dict(f3_notices_1))
                 if sim_df is not None and len(sim_df) > 0:
                     write_csv_f3(os.path.join(outputs_dir, "simulation_daily.csv"), sim_df)
+
+                    # Auditoría inbound multi-ESTATUS (nuevo)
+                    try:
+                        if isinstance(f3_extra, dict):
+                            df_det = f3_extra.get("inbound_audit_daily_detail")
+                            df_piv = f3_extra.get("inbound_audit_daily_pivot")
+                            if df_det is not None and isinstance(df_det, pd.DataFrame) and len(df_det) >= 0:
+                                write_csv_f3(os.path.join(outputs_dir, "inbound_audit_daily_detail.csv"), df_det)
+                            if df_piv is not None and isinstance(df_piv, pd.DataFrame) and len(df_piv) >= 0:
+                                write_csv_f3(os.path.join(outputs_dir, "inbound_audit_daily_pivot.csv"), df_piv)
+                    except Exception:
+                        # No romper el RUN por auditoría; el motor ya reporta TECH_ERROR en NOTICES si falló.
+                        pass
 
                     # Generar heatmaps (Service Level mensual) desde el CSV recién exportado
                     # - 1 general (todos los SKUs)
