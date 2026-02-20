@@ -127,35 +127,486 @@ def _build_daily_demand_decimal(
     return dd, totals_by_sku
 
 
-def _build_inbound_schedule(
-    transit_df: pd.DataFrame,
+
+# ---------------------------------------------------------------------------
+# Inbound multi-ESTATUS (F3.x) + auditoría diaria
+# ---------------------------------------------------------------------------
+
+_VALID_INBOUND_STATUS_ORDER = [
+    "Tránsito",
+    "Con reserva",
+    "Lista",
+    "En producción",
+    "Falta depósito",
+]
+
+_EXCLUDED_STATUS = {"Entregado"}
+
+_STATUS_TO_COL = {
+    "Tránsito": "inbound_transito",
+    "Con reserva": "inbound_con_reserva",
+    "Lista": "inbound_lista",
+    "En producción": "inbound_en_produccion",
+    "Falta depósito": "inbound_falta_deposito",
+}
+
+def _norm_key(x: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(x).strip().lower())
+
+def _find_sheet_name(xls: pd.ExcelFile, wanted: str) -> str:
+    wk = _norm_key(wanted)
+    # exact normalized match
+    for sh in xls.sheet_names:
+        if _norm_key(sh) == wk:
+            return sh
+    # contains match
+    for sh in xls.sheet_names:
+        shk = _norm_key(sh)
+        if wk in shk or shk in wk:
+            return sh
+    raise KeyError(f"No se encontró hoja '{wanted}' en {xls.sheet_names}")
+
+def _col_any(df: pd.DataFrame, candidates: list[str]) -> str:
+    if df is None or df.empty:
+        raise KeyError(f"DataFrame vacío al buscar columnas {candidates}")
+    # exact
+    for c in candidates:
+        if c in df.columns:
+            return c
+    # case-insensitive
+    lower_map = {str(c).strip().lower(): c for c in df.columns}
+    for c in candidates:
+        k = str(c).strip().lower()
+        if k in lower_map:
+            return lower_map[k]
+    # normalized
+    norm_map = {_norm_key(c): c for c in df.columns}
+    for c in candidates:
+        nk = _norm_key(c)
+        if nk in norm_map:
+            return norm_map[nk]
+    raise KeyError(f"No se encontró ninguna columna {candidates} en {list(df.columns)}")
+
+def _parse_date_cell(x: object) -> date | None:
+    if x is None or (isinstance(x, float) and pd.isna(x)) or (isinstance(x, str) and not x.strip()):
+        return None
+    try:
+        ts = pd.to_datetime(x, errors="coerce")
+    except Exception:
+        ts = pd.NaT
+    if pd.isna(ts):
+        return None
+    try:
+        return ts.date()
+    except Exception:
+        return None
+
+
+def _parse_lt_cell(x: object) -> tuple[date | None, str]:
+    """
+    LT es FECHA. Status:
+      OK / VACIO / INVALIDO / AMBIGUO
+
+    Regla contractual: si no puede parsearse de forma segura, NO se usa (cae a defaults).
+    Consideramos AMBIGUO cuando falta el año (ej: '20/3', '20-3') o cuando el string
+    no contiene un año explícito y el parser podría estar infiriéndolo.
+    """
+    if x is None or (isinstance(x, float) and pd.isna(x)) or (isinstance(x, str) and not x.strip()):
+        return None, "VACIO"
+
+    s = str(x).strip()
+
+    # Ambiguo típico: dd/mm sin año
+    if re.fullmatch(r"\d{1,2}[/-]\d{1,2}", s):
+        return None, "AMBIGUO"
+
+    ts = None
+    try:
+        ts = pd.to_datetime(x, errors="coerce", dayfirst=True)
+    except Exception:
+        ts = pd.NaT
+
+    if pd.isna(ts):
+        return None, "INVALIDO"
+
+    # Si es string y no tiene año explícito, lo marcamos ambiguo (evitamos supuestos)
+    if isinstance(x, str) and not re.search(r"\b(19|20)\d{2}\b", s):
+        return None, "AMBIGUO"
+
+    try:
+        return ts.date(), "OK"
+    except Exception:
+        return None, "INVALIDO"
+
+
+def _parse_date_cell_with_hoy(x: object, hoy: date) -> date | None:
+    """Parsea fechas permitiendo formatos dd/mm o dd-mm sin año.
+    Regla: si falta año, se asume hoy.year; si queda en el pasado vs HOY, se asume año siguiente.
+    Se usa SOLO para LT (que a veces viene sin año por formato de Excel).
+    """
+    d = _parse_date_cell(x)
+    if d is not None:
+        return d
+    if x is None:
+        return None
+    if isinstance(x, str):
+        s = x.strip()
+        m = re.match(r"^(\d{1,2})[\-/](\d{1,2})$", s)
+        if m:
+            day = int(m.group(1))
+            month = int(m.group(2))
+            try:
+                cand = date(hoy.year, month, day)
+            except Exception:
+                return None
+            if cand < hoy:
+                try:
+                    cand = date(hoy.year + 1, month, day)
+                except Exception:
+                    return None
+            return cand
+    return None
+
+def _num_or_none(x: object) -> float | None:
+    try:
+        v = float(pd.to_numeric(x, errors="coerce"))
+    except Exception:
+        return None
+    if pd.isna(v):
+        return None
+    return v
+
+def _join_unique_iso(values: list[object]) -> str:
+    vals = []
+    for v in values:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            continue
+        if isinstance(v, (date, datetime)):
+            vals.append(v.date().isoformat() if isinstance(v, datetime) else v.isoformat())
+        else:
+            s = str(v).strip()
+            if s:
+                vals.append(s)
+    uniq = sorted(set(vals))
+    return ";".join(uniq)
+
+def _read_defaults_from_info_comp(info_comp_path: str) -> tuple[float, float]:
+    xls = pd.ExcelFile(info_comp_path, engine="openpyxl")
+    sh_opts = _find_sheet_name(xls, "Opciones logisticas")
+    df_opts = pd.read_excel(xls, sheet_name=sh_opts)
+    prod_col = _col_any(df_opts, ["Production Time Default", "ProductionTimeDefault", "Production_Time_Default"])
+    transit_col = _col_any(df_opts, ["Transit Time Default", "TransitTimeDefault", "Transit_Time_Default"])
+    prod_default = _num_or_none(df_opts[prod_col].dropna().iloc[0] if len(df_opts[prod_col].dropna()) else None)
+    transit_default = _num_or_none(df_opts[transit_col].dropna().iloc[0] if len(df_opts[transit_col].dropna()) else None)
+    if prod_default is None:
+        prod_default = 0.0
+    if transit_default is None:
+        transit_default = 0.0
+    return float(prod_default), float(transit_default)
+
+def _read_provider_maps(info_comp_path: str) -> tuple[dict[str, str], dict[str, tuple[float|None, float|None]], float, float]:
+    xls = pd.ExcelFile(info_comp_path, engine="openpyxl")
+
+    sh_sku = _find_sheet_name(xls, "SKU - Especificaciones")
+    df_sku = pd.read_excel(xls, sheet_name=sh_sku)
+    sku_col = _col_any(df_sku, ["SKU"])
+    prov_col = _col_any(df_sku, ["Proveedor", "PROVEEDOR"])
+    df_sku = df_sku[[sku_col, prov_col]].copy()
+    df_sku[sku_col] = _safe_strip_series(df_sku[sku_col].astype(str))
+    df_sku[prov_col] = _safe_strip_series(df_sku[prov_col].astype(str))
+    sku_to_prov = {str(s).strip(): str(p).strip() for s, p in zip(df_sku[sku_col], df_sku[prov_col]) if str(s).strip()}
+
+    sh_prov = _find_sheet_name(xls, "Proveedores")
+    df_p = pd.read_excel(xls, sheet_name=sh_prov)
+    p_name_col = _col_any(df_p, ["Proveedor", "PROVEEDOR"])
+    prod_col = _col_any(df_p, ["Production Time", "ProductionTime", "Production_Time"])
+    transit_col = _col_any(df_p, ["Transit Time", "TransitTime", "Transit_Time"])
+    df_p = df_p[[p_name_col, prod_col, transit_col]].copy()
+    df_p[p_name_col] = _safe_strip_series(df_p[p_name_col].astype(str))
+
+    prov_to_times: dict[str, tuple[float|None, float|None]] = {}
+    for _, r in df_p.iterrows():
+        name = str(r[p_name_col]).strip()
+        if not name:
+            continue
+        prod = _num_or_none(r[prod_col])
+        transit = _num_or_none(r[transit_col])
+        prov_to_times[name] = (prod, transit)
+
+    prod_def, transit_def = _read_defaults_from_info_comp(info_comp_path)
+    return sku_to_prov, prov_to_times, float(prod_def), float(transit_def)
+
+def _build_inbound_multi_status_and_audit(
+    *,
+    importaciones_path: str,
+    info_comp_path: str,
     fecha_corte: date,
     horizon_end: date,
-    buffer_eta_days: int = BUFFER_ETA_DIAS_DEFAULT,
-) -> pd.DataFrame:
-    """v1.4: FECHA_INGRESO = ETA + BUFFER_ETA_DIAS"""
-    if transit_df is None or len(transit_df) == 0:
-        return pd.DataFrame(columns=["date", "SKU", "qty"])
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[ValidationIssue]]:
+    """
+    Construye inbound diario (para simulación) con estados multi-ESTATUS y genera outputs de auditoría.
 
-    t = transit_df.copy()
-    t["SKU"] = _safe_strip_series(t["SKU"])
-    t["Cantidad"] = pd.to_numeric(t["Cantidad"], errors="coerce").fillna(0.0)
-    t["ETA"] = pd.to_datetime(t["ETA"], errors="coerce")
+    Fuente única importaciones: Importaciones.xlsx → hoja IMPORTACIONES (ESTATUS, SKU, Cantidad, ETA, LT, ETD).
+    Fuente única logística: Informacion Complementaria (2).xlsx (SKU→Proveedor, tiempos por proveedor y defaults).
 
-    t = t.dropna(subset=["ETA"])
-    t["date"] = t["ETA"] + pd.to_timedelta(buffer_eta_days, unit="D")
-    t["date"] = t["date"].dt.normalize()
+    HOY es determinista y se define como fecha_corte (fecha de corte efectiva del RUN).
+    """
+    notices: list[ValidationIssue] = []
 
-    d0 = pd.to_datetime(fecha_corte)
-    d1 = pd.to_datetime(horizon_end)
-    t = t[(t["date"] >= d0) & (t["date"] <= d1)].copy()
+    # --- leer importaciones ---
+    try:
+        df = pd.read_excel(importaciones_path, sheet_name="IMPORTACIONES", engine="openpyxl")
+    except Exception as e:
+        notices.append(_issue(
+            file=importaciones_path, sheet="IMPORTACIONES", column="(STRUCTURE)", bad_rows=[],
+            code="IMPO_SHEET_READ_FAIL",
+            message=f"F3 inbound: no se pudo leer hoja IMPORTACIONES: {type(e).__name__}: {e}",
+            type_="TECH_ERROR"
+        ))
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), notices
 
-    inbound = (
-        t.groupby(["date", "SKU"], as_index=False)["Cantidad"]
-        .sum()
-        .rename(columns={"Cantidad": "qty"})
-    )
-    return inbound
+    # columnas mínimas
+    required = ["ESTATUS", "SKU", "Cantidad"]
+    missing_cols = [c for c in required if c not in df.columns]
+    if missing_cols:
+        for c in missing_cols:
+            notices.append(_issue(
+                file=importaciones_path, sheet="IMPORTACIONES", column=c, bad_rows=[],
+                code="IMPO_COL_MISSING",
+                message=f"F3 inbound: falta columna obligatoria en IMPORTACIONES: {c}",
+                type_="DATA_ERROR"
+            ))
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), notices
+
+    df = df.copy()
+    df["ESTATUS"] = df["ESTATUS"].astype(str).str.strip()
+    df["SKU"] = df["SKU"].astype(str).str.strip()
+    df["Cantidad"] = pd.to_numeric(df["Cantidad"], errors="coerce").fillna(0.0)
+
+    # parse fechas (si existen)
+    df["ETA_parsed"] = df["ETA"].apply(_parse_date_cell) if "ETA" in df.columns else None
+    if "LT" in df.columns:
+        _lt_tmp = df["LT"].apply(_parse_lt_cell)
+        df["LT_parsed"] = _lt_tmp.apply(lambda t: t[0])
+        df["LT_PARSE_STATUS"] = _lt_tmp.apply(lambda t: t[1])
+    else:
+        df["LT_parsed"] = None
+        df["LT_PARSE_STATUS"] = "VACIO"
+    df["ETD_parsed"] = df["ETD"].apply(_parse_date_cell) if "ETD" in df.columns else None
+
+    # filtrar estados válidos + excluir entregado
+    valid_set = set(_VALID_INBOUND_STATUS_ORDER)
+    df = df[df["ESTATUS"].isin(valid_set.union(_EXCLUDED_STATUS))].copy()
+    df = df[df["ESTATUS"] != "Entregado"].copy()
+
+    # --- leer metadata / defaults ---
+    try:
+        sku_to_prov, prov_to_times, prod_default, transit_default = _read_provider_maps(info_comp_path)
+    except Exception as e:
+        notices.append(_issue(
+            file=info_comp_path, sheet="(metadata)", column="(STRUCTURE)", bad_rows=[],
+            code="INFO_COMP_READ_FAIL",
+            message=f"F3 inbound: no se pudo leer metadata logística: {type(e).__name__}: {e}",
+            type_="TECH_ERROR"
+        ))
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), notices
+
+    hoy = fecha_corte
+
+    rows = []
+    for idx, r in df.iterrows():
+        est = str(r["ESTATUS"]).strip()
+        sku = str(r["SKU"]).strip()
+        qty = float(r["Cantidad"]) if not pd.isna(r["Cantidad"]) else 0.0
+
+        prov_raw = sku_to_prov.get(sku, None)
+        if prov_raw is None:
+            prov = ""
+            prov_match_status = "SKU_NO_ENCONTRADO"
+        else:
+            prov = str(prov_raw).strip()
+            if not prov:
+                prov_match_status = "PROVEEDOR_VACIO"
+            else:
+                prov_match_status = "MATCH_OK" if prov in prov_to_times else "PROVEEDOR_NO_EXISTE"
+
+        regla_base = "PROVEEDOR_OK" if prov_match_status == "MATCH_OK" else f"DEFAULT_SIN_PROVEEDOR|{prov_match_status}"
+
+
+        prod = None
+        transit = None
+        if prov:
+            prod, transit = prov_to_times.get(prov, (None, None))
+        prod_used = float(prod) if prod is not None else float(prod_default)
+        transit_used = float(transit) if transit is not None else float(transit_default)
+        prod_fallback = (prod is None)
+        transit_fallback = (transit is None)
+
+        eta_orig = r["ETA"] if "ETA" in df.columns else None
+        lt_orig = r["LT"] if "LT" in df.columns else None
+        eta_fecha = r.get("ETA_parsed", None)
+        lt_fecha = r.get("LT_parsed", None)
+        lt_parse_status = r.get("LT_PARSE_STATUS", "VACIO")
+
+        incluido = True
+        motivo_excl = ""
+        regla_usada = ""
+        eta_eff: date | None = None
+
+        if est == "Tránsito":
+            if eta_fecha:
+                eta_eff = eta_fecha
+                regla_usada = "TRANSITO_CON_ETA"
+            else:
+                incluido = False
+                motivo_excl = "TRÁNSITO_SIN_ETA"
+                regla_usada = "TRANSITO_SIN_ETA_EXCLUIDO"
+
+        elif est in ("Con reserva", "Lista"):
+            if eta_fecha:
+                eta_eff = eta_fecha
+                regla_usada = f"{_norm_key(est).upper()}_CON_ETA"
+            else:
+                eta_eff = hoy + timedelta(days=int(round(transit_used)))
+                regla_usada = f"{_norm_key(est).upper()}_SIN_ETA_HOY_MAS_TRANSIT"
+
+        elif est == "En producción":
+            if eta_fecha:
+                eta_eff = eta_fecha
+                regla_usada = "EN_PRODUCCION_CON_ETA"
+            elif lt_fecha and lt_parse_status == "OK":
+                eta_eff = lt_fecha + timedelta(days=int(round(transit_used)))
+                regla_usada = "EN_PRODUCCION_SIN_ETA_USA_LT_MAS_TRANSIT"
+            else:
+                eta_eff = hoy + timedelta(days=int(round(prod_used + transit_used)))
+                regla_usada = f"EN_PRODUCCION_SIN_ETA_NI_LT_HOY_MAS_PROD_MAS_TRANSIT|LT_{lt_parse_status}"
+
+        elif est == "Falta depósito":
+            if eta_fecha:
+                eta_eff = eta_fecha
+                regla_usada = "FALTA_DEPOSITO_CON_ETA"
+            else:
+                eta_eff = hoy + timedelta(days=int(round(prod_used + transit_used)))
+                regla_usada = "FALTA_DEPOSITO_SIN_ETA_HOY_MAS_PROD_MAS_TRANSIT"
+
+        else:
+            incluido = False
+            motivo_excl = "ESTATUS_NO_VALIDO"
+            regla_usada = "EXCLUIDO"
+
+        # ventana horizonte: solo aplica para incluidos con ETA efectiva
+        if incluido and eta_eff:
+            if eta_eff < fecha_corte or eta_eff > horizon_end:
+                incluido = False
+                motivo_excl = "FUERA_HORIZONTE"
+                regla_usada = f"{regla_usada}|FUERA_HORIZONTE"
+
+        rows.append({
+            "date": eta_eff.isoformat() if (incluido and eta_eff) else "",
+            "SKU": sku,
+            "Proveedor": prov,
+            "PROVEEDOR_RESUELTO": prov,
+            "PROVEEDOR_MATCH_STATUS": prov_match_status,
+            "PROD_DIAS_USADOS": prod_used,
+            "TRANSIT_DIAS_USADOS": transit_used,
+            "ESTATUS": est,
+            "Cantidad_inbound": qty,
+            "ETA_original": eta_orig,
+            "LT_original": lt_orig,
+            "LT_PARSE_STATUS": lt_parse_status,
+            "ETA_EFECTIVA": eta_eff.isoformat() if eta_eff else "",
+            "PROD_DIAS_usado": prod_used,
+            "TRANSIT_DIAS_usado": transit_used,
+            "REGLA_USADA": (regla_base + "|" + regla_usada + ("|PROD_DEFAULT" if prod_fallback else "") + ("|TRANSIT_DEFAULT" if transit_fallback else "")),
+            "INCLUIDO": bool(incluido),
+            "MOTIVO_EXCLUSION": motivo_excl,
+        })
+
+    detail_raw = pd.DataFrame(rows)
+
+    # Consolidar a 1 fila por (date, SKU, ESTATUS) — respetando el contrato
+    def _agg_join(s: pd.Series) -> str:
+        return "|".join(sorted({str(x).strip() for x in s.dropna().tolist() if str(x).strip()}))
+
+    if len(detail_raw) > 0:
+        # incluidos (date no vacío)
+        inc = detail_raw[detail_raw["INCLUIDO"] == True].copy()
+        exc = detail_raw[detail_raw["INCLUIDO"] == False].copy()
+
+        agg_cols = {
+            "Cantidad_inbound": "sum",
+            "Proveedor": _agg_join,
+            "PROVEEDOR_RESUELTO": _agg_join,
+            "PROVEEDOR_MATCH_STATUS": _agg_join,
+            "PROD_DIAS_USADOS": lambda s: float(pd.to_numeric(s, errors="coerce").dropna().iloc[0]) if len(pd.to_numeric(s, errors="coerce").dropna()) else float(prod_default),
+            "TRANSIT_DIAS_USADOS": lambda s: float(pd.to_numeric(s, errors="coerce").dropna().iloc[0]) if len(pd.to_numeric(s, errors="coerce").dropna()) else float(transit_default),
+            "ETA_original": lambda s: _join_unique_iso(s.tolist()),
+            "LT_original": lambda s: _join_unique_iso(s.tolist()),
+            "ETA_EFECTIVA": _agg_join,
+            "PROD_DIAS_usado": lambda s: float(pd.to_numeric(s, errors="coerce").dropna().iloc[0]) if len(pd.to_numeric(s, errors="coerce").dropna()) else float(prod_default),
+            "TRANSIT_DIAS_usado": lambda s: float(pd.to_numeric(s, errors="coerce").dropna().iloc[0]) if len(pd.to_numeric(s, errors="coerce").dropna()) else float(transit_default),
+            "REGLA_USADA": _agg_join,
+            "INCLUIDO": "max",
+            "MOTIVO_EXCLUSION": _agg_join,
+        }
+
+        detail_inc = inc.groupby(["date", "SKU", "ESTATUS"], as_index=False).agg(agg_cols) if len(inc) else pd.DataFrame(columns=detail_raw.columns)
+        # excluidos: consolidar por (SKU, ESTATUS) con date vacío (contrato exige columna date igualmente)
+        if len(exc):
+            exc2 = exc.copy()
+            exc2["date"] = ""
+            detail_exc = exc2.groupby(["date", "SKU", "ESTATUS"], as_index=False).agg(agg_cols)
+        else:
+            detail_exc = pd.DataFrame(columns=detail_inc.columns)
+
+        detail = pd.concat([detail_inc, detail_exc], ignore_index=True)
+    else:
+        detail = detail_raw.copy()
+
+    # inbound schedule para simulación (solo incluidos)
+    if len(detail) and "INCLUIDO" in detail.columns:
+        inc2 = detail[detail["INCLUIDO"] == True].copy()
+    else:
+        inc2 = pd.DataFrame()
+
+    if len(inc2):
+        inbound_schedule = inc2[["date", "SKU", "Cantidad_inbound"]].copy()
+        inbound_schedule = inbound_schedule.rename(columns={"Cantidad_inbound": "qty"})
+        inbound_schedule["date"] = pd.to_datetime(inbound_schedule["date"])
+        inbound_schedule["SKU"] = _safe_strip_series(inbound_schedule["SKU"])
+        inbound_schedule["qty"] = pd.to_numeric(inbound_schedule["qty"], errors="coerce").fillna(0.0)
+        inbound_schedule = inbound_schedule.groupby(["date", "SKU"], as_index=False)["qty"].sum()
+        inbound_schedule["date"] = inbound_schedule["date"].dt.date.apply(lambda d: d.isoformat())
+    else:
+        inbound_schedule = pd.DataFrame(columns=["date", "SKU", "qty"])
+
+    # pivot por estado (solo incluidos) + total
+    if len(inc2):
+        piv = inc2.copy()
+        piv["date"] = piv["date"].astype(str)
+        piv["SKU"] = _safe_strip_series(piv["SKU"])
+        piv["Cantidad_inbound"] = pd.to_numeric(piv["Cantidad_inbound"], errors="coerce").fillna(0.0)
+
+        piv["col"] = piv["ESTATUS"].map(_STATUS_TO_COL).fillna("")
+        piv = piv[piv["col"] != ""]
+        pivot = piv.pivot_table(index=["date", "SKU"], columns="col", values="Cantidad_inbound", aggfunc="sum", fill_value=0.0).reset_index()
+        for col in _STATUS_TO_COL.values():
+            if col not in pivot.columns:
+                pivot[col] = 0.0
+        pivot["inbound_total"] = pivot[list(_STATUS_TO_COL.values())].sum(axis=1)
+        pivot = pivot[["date", "SKU", "inbound_total"] + list(_STATUS_TO_COL.values())]
+    else:
+        pivot = pd.DataFrame(columns=["date", "SKU", "inbound_total"] + list(_STATUS_TO_COL.values()))
+
+    # asegurar orden de columnas en detail
+    detail = detail[[
+        "date", "SKU", "Proveedor", "PROVEEDOR_RESUELTO", "PROVEEDOR_MATCH_STATUS", "ESTATUS", "Cantidad_inbound",
+        "ETA_original", "LT_original", "ETA_EFECTIVA",
+        "PROD_DIAS_usado", "TRANSIT_DIAS_usado", "PROD_DIAS_USADOS", "TRANSIT_DIAS_USADOS",
+        "REGLA_USADA", "INCLUIDO", "MOTIVO_EXCLUSION"
+    ]].copy()
+
+    return inbound_schedule, detail, pivot, notices
 
 
 def simulate_f3_1_baseline(
@@ -167,10 +618,11 @@ def simulate_f3_1_baseline(
     proyeccion_path: str,
     modulo_central_path: str,
     importaciones_path: str,
+    info_comp_path: str,
     fecha_corte: date,
     lead_time_days: int = LEAD_TIME_DEFAULT_DAYS,
     cobertura_days: int = COVERAGE_DEFAULT_DAYS,
-) -> Tuple[pd.DataFrame, dict, List[ValidationIssue]]:
+) -> Tuple[pd.DataFrame, dict, List[ValidationIssue], dict]:
     """
     F3.1: simulación diaria baseline (sin compras)
       - decimales
@@ -182,6 +634,7 @@ def simulate_f3_1_baseline(
     pero se loguean en KPIs para trazabilidad del escenario.
     """
     notices: List[ValidationIssue] = []
+    extra_outputs: dict = {}
 
     month_dates = []
     for c in proj_df.columns:
@@ -203,7 +656,7 @@ def simulate_f3_1_baseline(
             message="F3.1: no se detectaron meses activos >= MES_CORTE para simular.",
             type_="TECH_ERROR"
         ))
-        return pd.DataFrame(), {"status": "NO_DATA"}, notices
+        return pd.DataFrame(), {"status": "NO_DATA"}, notices, extra_outputs, extra_outputs
 
     horizon_end = _month_end(month_dates[-1])
 
@@ -215,9 +668,17 @@ def simulate_f3_1_baseline(
             message="F3.1: demanda diaria vacía (no hay filas).",
             type_="TECH_ERROR"
         ))
-        return pd.DataFrame(), {"status": "NO_DATA"}, notices
+        return pd.DataFrame(), {"status": "NO_DATA"}, notices, extra_outputs, extra_outputs
 
-    inbound_df = _build_inbound_schedule(transit_df, fecha_corte, horizon_end, BUFFER_ETA_DIAS_DEFAULT)
+    inbound_df, inbound_audit_detail, inbound_audit_pivot, inbound_notices = _build_inbound_multi_status_and_audit(
+        importaciones_path=importaciones_path,
+        info_comp_path=info_comp_path,
+        fecha_corte=fecha_corte,
+        horizon_end=horizon_end,
+    )
+    notices.extend(inbound_notices)
+    extra_outputs["inbound_audit_daily_detail"] = inbound_audit_detail
+    extra_outputs["inbound_audit_daily_pivot"] = inbound_audit_pivot
 
     proj_skus = set(_safe_strip_series(proj_df["SKU"]).tolist())
 
@@ -313,7 +774,7 @@ def simulate_f3_1_baseline(
         "FILL_RATE": fill_rate,
     }
 
-    return out, kpis, notices
+    return out, kpis, notices, extra_outputs
 
 
 def plan_purchase_f3_2_scenario(
@@ -342,7 +803,7 @@ def plan_purchase_f3_2_scenario(
             message="F3.2: simulation_df vacío; no se puede calcular plan de compra.",
             type_="TECH_ERROR"
         ))
-        return pd.DataFrame(), {"status": "NO_DATA"}, notices
+        return pd.DataFrame(), {"status": "NO_DATA"}, notices, extra_outputs, extra_outputs
 
     sim = simulation_df.copy()
     sim["date"] = pd.to_datetime(sim["date"])
@@ -372,7 +833,7 @@ def plan_purchase_f3_2_scenario(
             "ARRIVAL_DATE": arrival_date.date().isoformat(),
             "COBERTURA_DIAS": int(cobertura_days),
             "LEAD_TIME_DIAS": int(lead_time_days),
-        }, notices
+        }, notices, extra_outputs
 
     sim_arrival = sim[sim["date"] == arrival_date].copy()
     sim_arrival["stock_al_ingreso"] = sim_arrival["on_hand_start"] + sim_arrival["inbound"]
@@ -512,7 +973,7 @@ def plan_purchase_logistico_contenedor_40hq(
             message=f"F3.3: no se pudo leer simulation_daily.csv: {type(e).__name__}: {e}",
             type_="TECH_ERROR"
         ))
-        return pd.DataFrame(), {"status": "NO_DATA"}, notices
+        return pd.DataFrame(), {"status": "NO_DATA"}, notices, extra_outputs, extra_outputs
 
     required_sim_cols = ["date", "SKU", "lost_sales"]
     missing = [c for c in required_sim_cols if c not in sim.columns]
@@ -523,7 +984,7 @@ def plan_purchase_logistico_contenedor_40hq(
             message=f"F3.3: faltan columnas en simulation_daily.csv: {missing}",
             type_="TECH_ERROR"
         ))
-        return pd.DataFrame(), {"status": "NO_DATA"}, notices
+        return pd.DataFrame(), {"status": "NO_DATA"}, notices, extra_outputs, extra_outputs
 
     sim["date"] = pd.to_datetime(sim["date"], errors="coerce")
     sim["SKU"] = _safe_strip_series(sim["SKU"])
@@ -534,7 +995,7 @@ def plan_purchase_logistico_contenedor_40hq(
     # quedarnos solo con días con quiebre real
     sim = sim[sim["lost_sales"] > 0].copy()
     if sim.empty:
-        return pd.DataFrame(), {"status": "NO_BREAKS"}, notices
+        return pd.DataFrame(), {"status": "NO_BREAKS"}, notices, extra_outputs
 
     # --- Leer Informacion Complementaria.xlsx ---
     try:
@@ -552,7 +1013,7 @@ def plan_purchase_logistico_contenedor_40hq(
             message=f"F3.3: no se pudo leer hoja SKU-ESPECIFICACIONES: {type(e).__name__}: {e}",
             type_="TECH_ERROR"
         ))
-        return pd.DataFrame(), {"status": "NO_DATA"}, notices
+        return pd.DataFrame(), {"status": "NO_DATA"}, notices, extra_outputs, extra_outputs
 
 
     try:
@@ -567,13 +1028,13 @@ def plan_purchase_logistico_contenedor_40hq(
             message=f"F3.3: faltan columnas en SKU-ESPECIFICACIONES: {type(e).__name__}: {e}",
             type_="TECH_ERROR"
         ))
-        return pd.DataFrame(), {"status": "NO_DATA"}, notices
+        return pd.DataFrame(), {"status": "NO_DATA"}, notices, extra_outputs, extra_outputs
         notices.append(_issue(
             file=info_complementaria_path, sheet="SKU-ESPECIFICACIONES", column="(STRUCTURE)", bad_rows=[],
             code="F3_3_META_MISSING_COLS",
             type_="TECH_ERROR"
         ))
-        return pd.DataFrame(), {"status": "NO_DATA"}, notices
+        return pd.DataFrame(), {"status": "NO_DATA"}, notices, extra_outputs, extra_outputs
 
     sku_meta = sku_meta[[c_sku, c_prov, c_vol, c_fob]].copy()
     sku_meta = sku_meta.rename(columns={c_sku:"SKU", c_prov:"PROVEEDOR", c_vol:"VOLUMEN_M3", c_fob:"FOB"})
@@ -594,7 +1055,7 @@ def plan_purchase_logistico_contenedor_40hq(
         sku_meta = sku_meta.drop(index=bad_vol.index).copy()
 
     if sku_meta.empty:
-        return pd.DataFrame(), {"status": "NO_META"}, notices
+        return pd.DataFrame(), {"status": "NO_META"}, notices, extra_outputs
 
     # capacidad 40HQ
     capacity_m3 = None
@@ -623,7 +1084,7 @@ def plan_purchase_logistico_contenedor_40hq(
             message=f'F3.3: no se pudo obtener CAPACIDAD_M3 para tipo="CONTENEDOR 40 HQ": {type(e).__name__}: {e}',
             type_="TECH_ERROR"
         ))
-        return pd.DataFrame(), {"status": "NO_DATA"}, notices
+        return pd.DataFrame(), {"status": "NO_DATA"}, notices, extra_outputs, extra_outputs
 
     if capacity_m3 is None or not (capacity_m3 > 0):
         notices.append(_issue(
@@ -632,7 +1093,7 @@ def plan_purchase_logistico_contenedor_40hq(
             message="F3.3: CAPACIDAD_M3 inválida para CONTENEDOR 40 HQ.",
             type_="TECH_ERROR"
         ))
-        return pd.DataFrame(), {"status": "NO_DATA"}, notices
+        return pd.DataFrame(), {"status": "NO_DATA"}, notices, extra_outputs, extra_outputs
 
     # --- Map SKU -> proveedor, volumen ---
     sku_to_provider = dict(zip(sku_meta["SKU"], sku_meta["PROVEEDOR"]))
@@ -647,7 +1108,7 @@ def plan_purchase_logistico_contenedor_40hq(
             message="F3.3: ningún SKU con quiebres coincide con SKU-ESPECIFICACIONES; no se genera plan logístico.",
             type_="DATA_ERROR"
         ))
-        return pd.DataFrame(), {"status": "NO_MATCH"}, notices
+        return pd.DataFrame(), {"status": "NO_MATCH"}, notices, extra_outputs
 
     sim["PROVEEDOR"] = sim["SKU"].map(sku_to_provider)
     sim["VOLUMEN_M3"] = sim["SKU"].map(sku_to_vol)
