@@ -53,6 +53,32 @@ def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
+def _norm_col(c: str) -> str:
+    # Normaliza nombres para matching robusto (sin suposiciones de casing/espacios)
+    c = str(c).strip().upper()
+    c = re.sub(r"\s+", "_", c)
+    c = re.sub(r"[^A-Z0-9_]", "", c)
+    return c
+
+
+def infer_fecha_corte_default_desde_mtd(modulo_central_path: str) -> date:
+    """
+    Inferencia estricta (contractual):
+    - NO usa reloj del sistema.
+    - SOLO se permite inferir desde MTD.FECHA_DESPACHO.
+    - Si falta la columna o no hay fechas parseables → error (sin fallback).
+    """
+    _, mtd_df = read_stock_and_mtd(modulo_central_path)
+    if mtd_df is None or mtd_df.empty:
+        raise ValueError("MTD vacío: no se puede inferir FECHA_CORTE_DEFAULT (FECHA_DESPACHO).")
+    if "FECHA_DESPACHO" not in mtd_df.columns:
+        raise ValueError("La hoja MTD no contiene la columna requerida 'FECHA_DESPACHO'.")
+    parsed = pd.to_datetime(mtd_df["FECHA_DESPACHO"], errors="coerce", dayfirst=True)
+    if parsed.notna().sum() == 0:
+        raise ValueError("No hay fechas parseables en MTD.FECHA_DESPACHO.")
+    return parsed.max().date()
+
+
 def save_uploaded_files(run_path: str, uploaded_files):
     inputs_dir = os.path.join(run_path, "inputs")
     os.makedirs(inputs_dir, exist_ok=True)
@@ -157,8 +183,9 @@ def to_json_safe_month_map(month_map: dict) -> dict:
     return safe
 
 
-def build_run_log_base(run_id: str, created_at_iso: str, fecha_corte_default_iso: str, input_files_meta,
-                       fecha_corte_override_iso: str | None, lead_time_days: int, cobertura_days: int):
+def build_run_log_base(run_id: str, created_at_iso: str, fecha_corte_default_iso: str | None, input_files_meta,
+                       fecha_corte_override_iso: str | None, lead_time_days: int, cobertura_days: int,
+                       fuente_fecha_corte: str, columna_usada: str | None, n_parse_ok: int | None, n_parse_fail: int | None):
     fecha_corte_efectiva = fecha_corte_override_iso or fecha_corte_default_iso
     return {
         "RUN_ID": run_id,
@@ -167,6 +194,14 @@ def build_run_log_base(run_id: str, created_at_iso: str, fecha_corte_default_iso
         "FECHA_CORTE_OVERRIDE": fecha_corte_override_iso,
         "FECHA_CORTE_EFECTIVA": fecha_corte_efectiva,
         "OVERRIDE_ACTIVO": bool(fecha_corte_override_iso),
+
+        # Auditoría contractual de fecha de corte
+        "fecha_corte_override": fecha_corte_override_iso,
+        "fecha_corte_usada": fecha_corte_efectiva,
+        "fuente_fecha_corte": fuente_fecha_corte,
+        "columna_usada": columna_usada,
+        "n_parse_ok": n_parse_ok,
+        "n_parse_fail": n_parse_fail,
 
         "PARAMETROS_RUN": {
             "FECHA_CORTE_OVERRIDE": fecha_corte_override_iso,
@@ -535,17 +570,45 @@ if uploaded:
 
         meta = save_uploaded_files(stage_run_path, uploaded)
 
-        # Inferencia determinística de FECHA_CORTE_DEFAULT desde MTD (max FECHA_DESPACHO)
-        try:
-            _, mtd_df = read_stock_and_mtd(modulo_central_path)
-            if mtd_df.empty:
-                raise ValueError("MTD vacío: no se puede inferir FECHA_CORTE_DEFAULT.")
-            fecha_corte_default = pd.to_datetime(mtd_df["FECHA_DESPACHO"]).max().date()
-        except Exception as e:
-            raise RuntimeError(f"No se pudo inferir FECHA_CORTE_DEFAULT desde MODULO CENTRAL: {str(e)}")
+        # FECHA CORTE (prioridad absoluta OVERRIDE)
+        # 1) Si hay FECHA_CORTE_OVERRIDE explícita → se usa y NO se intenta inferir nada.
+        # 2) Solo si no hay override → se infiere desde MODULO CENTRAL usando EXCLUSIVAMENTE la columna FECHA_DESPACHO.
+        # 3) Si falla la inferencia → se bloquea el RUN con error claro (sin fallback a otras columnas).
+        fuente_fecha_corte = None
+        columna_usada = None
+        n_parse_ok = None
+        n_parse_fail = None
+        fecha_corte_default_iso = None
 
-        fecha_corte_default_iso = fecha_corte_default.isoformat()
-        fecha_corte_efectiva_iso = fecha_override_iso or fecha_corte_default_iso
+        if fecha_override_iso:
+            # Prioridad absoluta
+            fecha_corte_efectiva_iso = fecha_override_iso
+            fuente_fecha_corte = "OVERRIDE"
+        else:
+            # Inferencia estricta: SOLO FECHA_DESPACHO
+            try:
+                _, mtd_df = read_stock_and_mtd(modulo_central_path)
+                if mtd_df.empty:
+                    raise ValueError("MTD vacío: no se puede inferir FECHA_CORTE_DEFAULT (FECHA_DESPACHO).")
+
+                if "FECHA_DESPACHO" not in mtd_df.columns:
+                    raise ValueError("La hoja MTD no contiene la columna requerida 'FECHA_DESPACHO' para inferir FECHA_CORTE_DEFAULT.")
+
+                columna_usada = "FECHA_DESPACHO"
+                parsed = pd.to_datetime(mtd_df[columna_usada], errors="coerce", dayfirst=True)
+
+                n_parse_ok = int(parsed.notna().sum())
+                n_parse_fail = int(len(parsed) - n_parse_ok)
+
+                if n_parse_ok == 0:
+                    raise ValueError("No hay fechas parseables en MTD.FECHA_DESPACHO; no se puede inferir FECHA_CORTE_DEFAULT.")
+
+                fecha_corte_default = parsed.max().date()
+                fecha_corte_default_iso = fecha_corte_default.isoformat()
+                fecha_corte_efectiva_iso = fecha_corte_default_iso
+                fuente_fecha_corte = "DEFAULT_INFERIDA"
+            except Exception as e:
+                raise RuntimeError(f"No se pudo inferir FECHA_CORTE_DEFAULT desde MODULO CENTRAL (columna FECHA_DESPACHO): {str(e)}")
 
         run_id = make_run_id(fecha_corte_efectiva_iso, combined_suffix)
         run_path = os.path.join(RUNS_DIR, run_id)
@@ -562,7 +625,8 @@ if uploaded:
 
         outputs_dir = os.path.join(run_path, "outputs")
         run_log = build_run_log_base(run_id, created_at_iso, fecha_corte_default_iso, meta, fecha_override_iso,
-                                   int(lead_time_days), int(cobertura_days))
+                                   int(lead_time_days), int(cobertura_days),
+                                   fuente_fecha_corte, columna_usada, n_parse_ok, n_parse_fail)
 
 
         name_to_path = {m["original_name"]: m["stored_path"] for m in meta}
