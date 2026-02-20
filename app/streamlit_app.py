@@ -508,61 +508,61 @@ if uploaded:
     order_mode = st.selectbox("Orden de SKUs (UI)", ["Alfabético", "Criticidad (menor cobertura promedio primero)"], 0)
 
     if st.button("🚀 RUN", type="primary", disabled=not can_run):
-        # --- Determinismo contractual (Candado A) ---
-# 1) Se crea un folder de staging basado en hash de inputs (sin reloj del sistema)
-# 2) Se infiere FECHA_CORTE_DEFAULT desde MODULO CENTRAL (max FECHA_DESPACHO) si no hay override
-# 3) RUN_ID y CREATED_AT derivan SOLO de FECHA_CORTE_EFECTIVA + hash (sin reloj_del_sistema)
-combined = hashlib.sha256()
-for uf in uploaded:
-    combined.update(uf.name.encode("utf-8"))
-    combined.update(b"\x00")
-    combined.update(uf.getvalue())
-combined.update(f"|LT={int(lead_time_days)}|COV={int(cobertura_days)}".encode("utf-8"))
-combined_suffix = combined.hexdigest()[:8]
+                # --- Determinismo contractual (Candado A) ---
+        # 1) Se crea un folder de staging basado en hash de inputs (sin reloj del sistema)
+        # 2) Se infiere FECHA_CORTE_DEFAULT desde MODULO CENTRAL (max FECHA_DESPACHO) si no hay override
+        # 3) RUN_ID y CREATED_AT derivan SOLO de FECHA_CORTE_EFECTIVA + hash (sin reloj_del_sistema)
+        combined = hashlib.sha256()
+        for uf in uploaded:
+            combined.update(uf.name.encode("utf-8"))
+            combined.update(b"\x00")
+            combined.update(uf.getvalue())
+        combined.update(f"|LT={int(lead_time_days)}|COV={int(cobertura_days)}".encode("utf-8"))
+        combined_suffix = combined.hexdigest()[:8]
 
-stage_run_id = f"STAGE_{combined_suffix}"
-stage_run_path = os.path.join(RUNS_DIR, stage_run_id)
-# evitar colisiones sin reloj: sufijo incremental
-if os.path.exists(stage_run_path):
-    k = 2
-    while os.path.exists(f"{stage_run_path}_{k}"):
-        k += 1
-    stage_run_path = f"{stage_run_path}_{k}"
+        stage_run_id = f"STAGE_{combined_suffix}"
+        stage_run_path = os.path.join(RUNS_DIR, stage_run_id)
+        # evitar colisiones sin reloj: sufijo incremental
+        if os.path.exists(stage_run_path):
+            k = 2
+            while os.path.exists(f"{stage_run_path}_{k}"):
+                k += 1
+            stage_run_path = f"{stage_run_path}_{k}"
 
-os.makedirs(stage_run_path, exist_ok=False)
-outputs_dir = os.path.join(stage_run_path, "outputs")
-os.makedirs(outputs_dir, exist_ok=True)
+        os.makedirs(stage_run_path, exist_ok=False)
+        outputs_dir = os.path.join(stage_run_path, "outputs")
+        os.makedirs(outputs_dir, exist_ok=True)
 
-meta = save_uploaded_files(stage_run_path, uploaded)
+        meta = save_uploaded_files(stage_run_path, uploaded)
 
-# Inferencia determinística de FECHA_CORTE_DEFAULT desde MTD (max FECHA_DESPACHO)
-try:
-    _, mtd_df = read_stock_and_mtd(modulo_central_path)
-    if mtd_df.empty:
-        raise ValueError("MTD vacío: no se puede inferir FECHA_CORTE_DEFAULT.")
-    fecha_corte_default = pd.to_datetime(mtd_df["FECHA_DESPACHO"]).max().date()
-except Exception as e:
-    raise RuntimeError(f"No se pudo inferir FECHA_CORTE_DEFAULT desde MODULO CENTRAL: {str(e)}")
+        # Inferencia determinística de FECHA_CORTE_DEFAULT desde MTD (max FECHA_DESPACHO)
+        try:
+            _, mtd_df = read_stock_and_mtd(modulo_central_path)
+            if mtd_df.empty:
+                raise ValueError("MTD vacío: no se puede inferir FECHA_CORTE_DEFAULT.")
+            fecha_corte_default = pd.to_datetime(mtd_df["FECHA_DESPACHO"]).max().date()
+        except Exception as e:
+            raise RuntimeError(f"No se pudo inferir FECHA_CORTE_DEFAULT desde MODULO CENTRAL: {str(e)}")
 
-fecha_corte_default_iso = fecha_corte_default.isoformat()
-fecha_corte_efectiva_iso = fecha_override_iso or fecha_corte_default_iso
+        fecha_corte_default_iso = fecha_corte_default.isoformat()
+        fecha_corte_efectiva_iso = fecha_override_iso or fecha_corte_default_iso
 
-run_id = make_run_id(fecha_corte_efectiva_iso, combined_suffix)
-run_path = os.path.join(RUNS_DIR, run_id)
-if os.path.exists(run_path):
-    k = 2
-    while os.path.exists(f"{run_path}_{k}"):
-        k += 1
-    run_path = f"{run_path}_{k}"
-    run_id = os.path.basename(run_path)
+        run_id = make_run_id(fecha_corte_efectiva_iso, combined_suffix)
+        run_path = os.path.join(RUNS_DIR, run_id)
+        if os.path.exists(run_path):
+            k = 2
+            while os.path.exists(f"{run_path}_{k}"):
+                k += 1
+            run_path = f"{run_path}_{k}"
+            run_id = os.path.basename(run_path)
 
-created_at_iso = f"{fecha_corte_efectiva_iso}T00:00:00"
+        created_at_iso = f"{fecha_corte_efectiva_iso}T00:00:00"
 
-os.rename(stage_run_path, run_path)
+        os.rename(stage_run_path, run_path)
 
-outputs_dir = os.path.join(run_path, "outputs")
-run_log = build_run_log_base(run_id, created_at_iso, fecha_corte_default_iso, meta, fecha_override_iso,
-                           int(lead_time_days), int(cobertura_days))
+        outputs_dir = os.path.join(run_path, "outputs")
+        run_log = build_run_log_base(run_id, created_at_iso, fecha_corte_default_iso, meta, fecha_override_iso,
+                                   int(lead_time_days), int(cobertura_days))
 
 
         name_to_path = {m["original_name"]: m["stored_path"] for m in meta}
